@@ -999,12 +999,7 @@ export async function imapAppendRawMessage(
     if (!uid) {
       const lock = await client.getMailboxLock(path);
       try {
-        const found = await client.search(
-          { header: { [lookupHeader.name]: lookupHeader.value } },
-          { uid: true }
-        );
-        const matches = Array.isArray(found) ? found : [];
-        uid = matches.at(-1);
+        uid = await findUidByHeader(client, cfg, path, lookupHeader);
       } finally {
         lock.release();
       }
@@ -1058,8 +1053,7 @@ export async function imapFindRawMessageByHeader(
     const path = await resolveSpecialMailboxPath(client, kind);
     const lock = await client.getMailboxLock(path);
     try {
-      const found = await client.search({ header: { [header.name]: header.value } }, { uid: true });
-      const uid = (Array.isArray(found) ? found : []).at(-1);
+      const uid = await findUidByHeader(client, cfg, path, header);
       if (!uid) return null;
       const message = await client.fetchOne(
         String(uid),
@@ -1096,29 +1090,55 @@ export async function imapListMessagesWithHeader(
     const path = await resolveSpecialMailboxPath(client, kind);
     const lock = await client.getMailboxLock(path);
     try {
-      const found = await client.search({ all: true }, { uid: true });
-      const uids = (Array.isArray(found) ? found : []).slice(-scanLimit);
-      const matches: ImapHeaderMatch[] = [];
-      if (!uids.length) return matches;
-      for await (const message of client.fetch(
-        uids.join(","),
-        { headers: [headerName], flags: true },
-        { uid: true }
-      )) {
-        const value = headerValue(message.headers, headerName);
-        if (!value) continue;
-        matches.push({
-          id: encodeImapId(cfg.accountLabel, path, message.uid),
-          uid: message.uid,
-          value,
-          flags: [...(message.flags ?? [])],
-        });
-      }
-      return matches.sort((a, b) => a.uid - b.uid);
+      return await scanHeader(client, cfg, path, headerName, scanLimit);
     } finally {
       lock.release();
     }
   });
+}
+
+/** The newest UID in the locked mailbox whose `header` has exactly this value. */
+async function findUidByHeader(
+  client: ImapClientLike,
+  cfg: ImapConfig,
+  path: string,
+  header: { name: string; value: string }
+): Promise<number | undefined> {
+  const found = await client.search({ header: { [header.name]: header.value } }, { uid: true });
+  if (Array.isArray(found)) return found.at(-1);
+  // iCloud refuses HEADER searches on custom fields such as the draft ID
+  // (imapflow returns false), so match those locally instead.
+  const matches = await scanHeader(client, cfg, path, header.name);
+  return matches.filter((match) => match.value === header.value).at(-1)?.uid;
+}
+
+/** Read `headerName` from the newest messages of the locked mailbox, oldest first. */
+async function scanHeader(
+  client: ImapClientLike,
+  cfg: ImapConfig,
+  path: string,
+  headerName: string,
+  scanLimit = 500
+): Promise<ImapHeaderMatch[]> {
+  const found = await client.search({ all: true }, { uid: true });
+  const uids = (Array.isArray(found) ? found : []).slice(-scanLimit);
+  const matches: ImapHeaderMatch[] = [];
+  if (!uids.length) return matches;
+  for await (const message of client.fetch(
+    uids.join(","),
+    { headers: [headerName], flags: true },
+    { uid: true }
+  )) {
+    const value = headerValue(message.headers, headerName);
+    if (!value) continue;
+    matches.push({
+      id: encodeImapId(cfg.accountLabel, path, message.uid),
+      uid: message.uid,
+      value,
+      flags: [...(message.flags ?? [])],
+    });
+  }
+  return matches.sort((a, b) => a.uid - b.uid);
 }
 
 /** Permanently remove one exact IMAP message. Intended for replaced/sent drafts. */

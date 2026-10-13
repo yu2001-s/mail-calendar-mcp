@@ -44,6 +44,9 @@ function fakeImap() {
       if (!header) return entries.map(([uid]) => uid);
       const [name, value] = Object.entries(header)[0] ?? [];
       if (!name) return [];
+      // Like iCloud: a HEADER search on a custom field is refused, which
+      // imapflow reports as false.
+      if (name.toLowerCase() !== "message-id") return false;
       const pattern = new RegExp(`^${name}:.*${value}`, "im");
       return entries.filter(([, raw]) => pattern.test(raw.toString())).map(([uid]) => uid);
     },
@@ -731,8 +734,10 @@ describe("drafts saved by other mail clients", () => {
   it("routes the imap: ID of a connector draft through its managed send", async () => {
     const fake = fakeImap();
     const smtpSend = vi.fn(async () => ({ success: true, messageId: "<m@example.com>" }));
+    const creator = new ImapDraftManager(managerOptions(fake.client, { smtpSend }));
+    const created = await creator.createDraft({ to: ["to@example.com"], subject: "S", body: "B" });
+    // Another client's session, which has never seen the draft.
     const manager = new ImapDraftManager(managerOptions(fake.client, { smtpSend }));
-    const created = await manager.createDraft({ to: ["to@example.com"], subject: "S", body: "B" });
 
     const sent = await manager.sendImapDraft(created.draft!.nativeId!, created.draft!.revision);
 

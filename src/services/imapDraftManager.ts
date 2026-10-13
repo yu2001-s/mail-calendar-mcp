@@ -261,17 +261,19 @@ export class ImapDraftManager {
    * The local registry is only a cache. A draft created or edited on another
    * device is recovered from its server copy through the connector draft header.
    */
-  private async resolveEntry(uuid: string): Promise<ImapDraftRegistryEntry | null> {
+  private async resolveEntry(
+    uuid: string,
+    knownImapId?: string
+  ): Promise<ImapDraftRegistryEntry | null> {
     if (!uuid) return null;
     const cached = this.load().drafts[uuid];
     if (cached) return cached;
     const account = this.defaultAccount();
     if (!account) return null;
-    const found = await imapFindRawMessageByHeader(
-      "drafts",
-      { name: DRAFT_ID_HEADER, value: uuid },
-      this.depsForAccount(account)
-    );
+    const deps = this.depsForAccount(account);
+    const found = knownImapId
+      ? await imapFetchRawMessage(knownImapId, deps)
+      : await imapFindRawMessageByHeader("drafts", { name: DRAFT_ID_HEADER, value: uuid }, deps);
     return found ? this.adopt(uuid, found, account) : null;
   }
 
@@ -426,7 +428,8 @@ export class ImapDraftManager {
   async listDrafts(): Promise<{ success: boolean; drafts?: Draft[]; error?: string }> {
     try {
       const account = this.defaultAccount();
-      const uuids = new Set<string>();
+      // Draft ID -> its newest server copy, when the scan found one.
+      const uuids = new Map<string, string | undefined>();
       // The server is authoritative: list every connector draft, including
       // those created on other devices, then any cached ones in other accounts.
       if (account) {
@@ -435,14 +438,16 @@ export class ImapDraftManager {
           DRAFT_ID_HEADER,
           this.depsForAccount(account)
         );
-        for (const match of matches) uuids.add(match.value);
+        for (const match of matches) uuids.set(match.value, match.id);
       }
       for (const [uuid, entry] of Object.entries(this.load().drafts)) {
-        if (entry.state !== "sent" && entry.account !== account) uuids.add(uuid);
+        if (entry.state !== "sent" && entry.account !== account && !uuids.has(uuid)) {
+          uuids.set(uuid, undefined);
+        }
       }
       const drafts: Draft[] = [];
-      for (const uuid of uuids) {
-        const entry = await this.resolveEntry(uuid);
+      for (const [uuid, imapId] of uuids) {
+        const entry = await this.resolveEntry(uuid, imapId);
         if (!entry || entry.state === "sent") continue;
         const current = await this.fetchCurrent(uuid, entry);
         if (!current) continue;
