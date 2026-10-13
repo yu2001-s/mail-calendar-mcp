@@ -7,6 +7,7 @@ import {
   imapFindRawMessageByHeader,
   imapListMessagesWithHeader,
   imapSetKeyword,
+  imapSpecialMailboxPath,
   isImapAccount,
   decodeImapId,
   type ImapDeps,
@@ -147,6 +148,19 @@ function draftUuid(draftId: string): string {
 
 export class ImapDraftManager {
   private memory: ImapDraftRegistry = emptyRegistry();
+  /**
+   * Send state of drafts other clients created, keyed by Message-ID. The
+   * server marker carries the same guard to other instances.
+   */
+  private imapSends = new Map<
+    string,
+    {
+      state: ImapDraftRegistryEntry["state"];
+      smtpMessageId?: string;
+      sentImapId?: string;
+      warning?: string;
+    }
+  >();
   private readonly identityResolver: (selector?: string) => SendingIdentity | null;
   private readonly depsForAccount: (account: string) => ImapDeps;
   private readonly accountForIdentity?: (identity: SendingIdentity) => string;
@@ -394,7 +408,8 @@ export class ImapDraftManager {
       subject: parsed.subject,
       body: parsed.body,
       htmlBody: parsed.htmlBody,
-      visible: false,
+      // A server draft shows in every mail client until it is sent.
+      visible: entry.state !== "sent",
       sourceKind: "imap",
       accountName: entry.account,
       mailboxName: imapId,
@@ -846,45 +861,12 @@ export class ImapDraftManager {
         this.save(registry);
       }
 
-      const messageId = parsed.messageId;
-      let sentCopy = messageId
-        ? await imapFindRawMessageByHeader(
-            "sent",
-            { name: "Message-ID", value: messageId },
-            this.depsForAccount(entry.account)
-          ).catch(() => null)
-        : null;
-      for (let attempt = 0; !sentCopy && messageId && attempt < 2; attempt += 1) {
-        await this.sleep(500);
-        sentCopy = await imapFindRawMessageByHeader(
-          "sent",
-          { name: "Message-ID", value: messageId },
-          this.depsForAccount(entry.account)
-        ).catch(() => null);
-      }
-
-      let warning: string | undefined;
-      if (!sentCopy && messageId) {
-        sentCopy = await imapAppendRawMessage(
-          deliverable,
-          "sent",
-          { name: "Message-ID", value: messageId },
-          this.depsForAccount(entry.account)
-        ).catch(() => null);
-        if (!sentCopy) {
-          warning =
-            "SMTP accepted the message, but the connector could not verify or append its Sent copy.";
-        }
-      }
-      const draftDeleted = await imapDeleteExactMessage(
+      const { sentCopy, warning } = await this.finishSend(
+        deliverable,
+        parsed.messageId,
         current.imapId,
-        this.depsForAccount(entry.account)
-      ).catch(() => false);
-      if (!draftDeleted) {
-        warning = warning
-          ? `${warning} The original Drafts copy also could not be removed.`
-          : "SMTP accepted the message, but the original Drafts copy could not be removed.";
-      }
+        entry.account
+      );
       registry = this.load();
       if (registry.drafts[uuid]) {
         registry.drafts[uuid].sentImapId = sentCopy?.id;
@@ -915,6 +897,279 @@ export class ImapDraftManager {
         }
       } catch {
         // Preserve the original failure.
+      }
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /**
+   * After SMTP accepted a draft: make sure Sent holds a copy, then remove the
+   * Drafts copy. Neither step submits mail again.
+   */
+  private async finishSend(
+    deliverable: Buffer,
+    messageId: string | undefined,
+    draftImapId: string,
+    account: string
+  ): Promise<{ sentCopy: ImapRawMessage | null; warning?: string }> {
+    const deps = this.depsForAccount(account);
+    const findSent = () =>
+      messageId
+        ? imapFindRawMessageByHeader("sent", { name: "Message-ID", value: messageId }, deps).catch(
+            () => null
+          )
+        : Promise.resolve(null);
+    let sentCopy = await findSent();
+    for (let attempt = 0; !sentCopy && messageId && attempt < 2; attempt += 1) {
+      await this.sleep(500);
+      sentCopy = await findSent();
+    }
+
+    let warning: string | undefined;
+    if (!sentCopy && messageId) {
+      sentCopy = await imapAppendRawMessage(
+        deliverable,
+        "sent",
+        { name: "Message-ID", value: messageId },
+        deps
+      ).catch(() => null);
+      if (!sentCopy) {
+        warning =
+          "SMTP accepted the message, but the connector could not verify or append its Sent copy.";
+      }
+    }
+    const draftDeleted = await imapDeleteExactMessage(draftImapId, deps).catch(() => false);
+    if (!draftDeleted) {
+      warning = warning
+        ? `${warning} The original Drafts copy also could not be removed.`
+        : "SMTP accepted the message, but the original Drafts copy could not be removed.";
+    }
+    return { sentCopy, warning };
+  }
+
+  /**
+   * Load a message from the server Drafts mailbox by its imap: id. Returns
+   * the connector draft id instead when the message is a managed draft.
+   */
+  private async loadImapDraft(
+    imapId: string
+  ): Promise<
+    | { managedId: string }
+    | { account: string; current: ImapRawMessage; parsed: ReturnType<typeof parseDraftMime> }
+    | { error: string }
+  > {
+    const ref = decodeImapId(imapId);
+    const account = this.defaultAccount();
+    if (!ref || !account || ref.account !== account) {
+      return { error: "Use a Drafts message ID returned by this connector's iCloud account." };
+    }
+    const deps = this.depsForAccount(account);
+    const draftsPath = await imapSpecialMailboxPath("drafts", deps);
+    if (ref.path !== draftsPath) {
+      return {
+        error: `"${imapId}" is in "${ref.path}", not the Drafts mailbox; only drafts can be sent.`,
+      };
+    }
+    const current = await imapFetchRawMessage(imapId, deps);
+    if (!current) {
+      return {
+        error: `Draft "${imapId}" no longer exists in the server Drafts mailbox; search Drafts and Sent for its current state.`,
+      };
+    }
+    const uuid = draftIdFromMime(current.raw);
+    if (uuid) return { managedId: `${DRAFT_PREFIX}${uuid}` };
+    return { account, current, parsed: parseDraftMime(current.raw) };
+  }
+
+  /** The cache entry an IMAP draft would have, for building its Draft resource. */
+  private imapDraftEntry(
+    account: string,
+    current: ImapRawMessage,
+    parsed: ReturnType<typeof parseDraftMime>,
+    state: ImapDraftRegistryEntry["state"]
+  ): ImapDraftRegistryEntry {
+    const email = senderEmail(parsed.from);
+    return {
+      imapId: current.id,
+      account,
+      identityId: email,
+      fromEmail: email,
+      revision: draftMimeRevision(current.raw),
+      messageId: parsed.messageId,
+      updatedAt: new Date().toISOString(),
+      state,
+    };
+  }
+
+  private imapDraftState(
+    current: ImapRawMessage,
+    parsed: ReturnType<typeof parseDraftMime>
+  ): ImapDraftRegistryEntry["state"] {
+    const local = parsed.messageId ? this.imapSends.get(parsed.messageId) : undefined;
+    if (local) return local.state;
+    return (current.flags ?? []).includes(SENDING_KEYWORD) ? "needs_review" : "draft";
+  }
+
+  /** Read any draft in the server Drafts mailbox by its imap: id. */
+  async getImapDraft(imapId: string): Promise<ImapDraftResult> {
+    try {
+      const loaded = await this.loadImapDraft(imapId);
+      if ("error" in loaded) return { success: false, error: loaded.error };
+      if ("managedId" in loaded) return this.getDraft(loaded.managedId);
+      const { account, current, parsed } = loaded;
+      const state = this.imapDraftState(current, parsed);
+      return {
+        success: true,
+        draft: this.toDraft(
+          imapId,
+          this.imapDraftEntry(account, current, parsed, state),
+          current.raw
+        ),
+        warning:
+          state === "draft"
+            ? undefined
+            : ((parsed.messageId && this.imapSends.get(parsed.messageId)?.warning) ??
+              REMOTE_SENDING_WARNING),
+      };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /**
+   * Send a draft that another client saved in the server Drafts mailbox,
+   * exactly as written: only Bcc is withheld from the delivered headers. A
+   * connector-managed draft is sent through sendDraft. The Drafts copy is
+   * removed only after SMTP accepts the message.
+   */
+  async sendImapDraft(imapId: string, expectedRevision?: string): Promise<ImapDraftResult> {
+    let messageId: string | undefined;
+    try {
+      const loaded = await this.loadImapDraft(imapId);
+      if ("error" in loaded) return { success: false, error: loaded.error };
+      if ("managedId" in loaded) return this.sendDraft(loaded.managedId, expectedRevision);
+      const { account, current, parsed } = loaded;
+      const deps = this.depsForAccount(account);
+      messageId = parsed.messageId;
+      if (!messageId) {
+        return {
+          success: false,
+          error: `Draft "${imapId}" has no Message-ID, so its Sent copy could not be matched; it was not sent.`,
+        };
+      }
+      const local = this.imapSends.get(messageId);
+      if (local?.state === "sent") {
+        return {
+          success: true,
+          smtpMessageId: local.smtpMessageId,
+          sentMessageId: local.sentImapId,
+          warning: "This draft was already sent; no second SMTP submission occurred.",
+        };
+      }
+      const duplicateRisk = {
+        success: false,
+        error: `Draft "${imapId}" previously entered the sending state. It was not retried to avoid a duplicate; verify Sent before taking further action.`,
+      };
+      if (this.imapDraftState(current, parsed) !== "draft") return duplicateRisk;
+
+      // Some client already submitted this message; only its Drafts cleanup is left.
+      const priorSend = await imapFindRawMessageByHeader(
+        "sent",
+        { name: "Message-ID", value: messageId },
+        deps
+      ).catch(() => null);
+      if (priorSend) {
+        const removed = await imapDeleteExactMessage(current.id, deps).catch(() => false);
+        const warning = `This draft is already in Sent; no second SMTP submission occurred.${
+          removed ? "" : " The leftover Drafts copy could not be removed."
+        }`;
+        this.imapSends.set(messageId, { state: "sent", sentImapId: priorSend.id, warning });
+        return { success: true, sentMessageId: priorSend.id, warning };
+      }
+      const revision = draftMimeRevision(current.raw);
+      if (expectedRevision && expectedRevision !== revision) {
+        return {
+          success: false,
+          error: `Draft revision conflict: expected ${expectedRevision}, current revision is ${revision}. Read the draft again before sending.`,
+        };
+      }
+      const recipients = [...parsed.to, ...parsed.cc, ...parsed.bcc];
+      if (recipients.length === 0) {
+        return { success: false, error: `Draft "${imapId}" has no recipients.` };
+      }
+      if (!parsed.from) {
+        return { success: false, error: `Draft "${imapId}" has no From address.` };
+      }
+      const identity = this.identityFor(senderEmail(parsed.from));
+      const config = this.smtpConfigResolver(identity);
+
+      this.imapSends.set(messageId, { state: "sending" });
+      const marked = await imapSetKeyword(current.id, SENDING_KEYWORD, true, deps)
+        .then((result) => result.success)
+        .catch(() => false);
+      const deliverable = prepareDraftMimeForSend(current.raw);
+      let sent: SmtpSendResult;
+      try {
+        sent = await this.smtpSend(
+          deliverable,
+          { from: identity.email, to: recipients.map(senderEmail) },
+          config
+        );
+      } catch (error) {
+        sent = {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          uncertain: true,
+        };
+      }
+      if (!sent.success) {
+        if (sent.uncertain) {
+          this.imapSends.set(messageId, { state: "needs_review", warning: sent.error });
+        } else {
+          // A definite rejection leaves the draft sendable again everywhere.
+          if (marked) {
+            await imapSetKeyword(current.id, SENDING_KEYWORD, false, deps).catch(() => undefined);
+          }
+          this.imapSends.delete(messageId);
+        }
+        return {
+          success: false,
+          error: sent.uncertain
+            ? `${sent.error ?? "SMTP outcome is uncertain."} Verify Sent before retrying.`
+            : (sent.error ?? "SMTP send failed."),
+        };
+      }
+
+      this.imapSends.set(messageId, { state: "sent", smtpMessageId: sent.messageId });
+      const { sentCopy, warning } = await this.finishSend(
+        deliverable,
+        messageId,
+        current.id,
+        account
+      );
+      this.imapSends.set(messageId, {
+        state: "sent",
+        smtpMessageId: sent.messageId,
+        sentImapId: sentCopy?.id,
+        warning,
+      });
+      return {
+        success: true,
+        draft: this.toDraft(
+          imapId,
+          this.imapDraftEntry(account, current, parsed, "sent"),
+          current.raw
+        ),
+        smtpMessageId: sent.messageId,
+        sentMessageId: sentCopy?.id,
+        warning,
+      };
+    } catch (error) {
+      if (messageId && this.imapSends.get(messageId)?.state === "sending") {
+        this.imapSends.set(messageId, {
+          state: "needs_review",
+          warning: "Sending outcome is uncertain. Verify Sent before retrying.",
+        });
       }
       return { success: false, error: error instanceof Error ? error.message : String(error) };
     }

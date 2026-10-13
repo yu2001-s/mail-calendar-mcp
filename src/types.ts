@@ -77,6 +77,7 @@ export interface Draft {
   body: string;
   /** Optional HTML alternative stored in the RFC 5322 draft. */
   htmlBody?: string;
+  /** Whether the draft is still in the server Drafts mailbox, i.e. not yet sent. */
   visible: boolean;
   /** Whether this handle came from a saved Drafts mailbox or a live compose session. */
   sourceKind: "mailbox" | "compose" | "imap";

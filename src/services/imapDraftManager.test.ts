@@ -598,3 +598,146 @@ describe("in-memory draft cache", () => {
     });
   });
 });
+
+describe("drafts saved by other mail clients", () => {
+  const draftUid = 500;
+  const imapId = encodeImapId("iCloud", "Drafts", draftUid);
+  const raw = Buffer.from(
+    [
+      "From: Sender <sender@example.com>",
+      "To: peggy@example.com",
+      "Cc: murphy@example.com",
+      "Bcc: hidden@example.com",
+      "Subject: Re: Contract",
+      "Message-ID: <apple-mail-draft@example.com>",
+      "In-Reply-To: <parent@example.com>",
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      "Written in Mail.",
+    ].join("\r\n")
+  );
+  function seedDraft(fake: ReturnType<typeof fakeImap>, source = raw) {
+    fake.boxes.get("Drafts")!.set(draftUid, source);
+    fake.flags.set(draftUid, new Set(["\\Draft", "\\Seen"]));
+  }
+
+  it("reads and sends an existing Drafts message exactly as written", async () => {
+    const fake = fakeImap();
+    seedDraft(fake);
+    let submitted = Buffer.alloc(0);
+    let envelope: { from: string; to: string[] } | undefined;
+    const smtpSend = vi.fn(async (body: Buffer, env: { from: string; to: string[] }) => {
+      submitted = body;
+      envelope = env;
+      return { success: true, messageId: "<apple-mail-draft@example.com>" };
+    });
+    const manager = new ImapDraftManager(managerOptions(fake.client, { smtpSend }));
+
+    const read = await manager.getImapDraft(imapId);
+    expect(read.draft).toMatchObject({
+      draftId: imapId,
+      to: ["peggy@example.com"],
+      body: "Written in Mail.",
+      deliveryState: "draft",
+      visible: true,
+    });
+
+    const sent = await manager.sendImapDraft(imapId, read.draft!.revision);
+
+    expect(sent).toMatchObject({ success: true, draft: { deliveryState: "sent", visible: false } });
+    expect(smtpSend).toHaveBeenCalledTimes(1);
+    expect(envelope).toEqual({
+      from: "sender@example.com",
+      to: ["peggy@example.com", "murphy@example.com", "hidden@example.com"],
+    });
+    expect(submitted.toString()).toBe(raw.toString().replace("Bcc: hidden@example.com\r\n", ""));
+    expect(fake.boxes.get("Drafts")?.size).toBe(0);
+    expect(fake.boxes.get("Sent")?.size).toBe(1);
+
+    // The sent draft left Drafts, so a repeat is refused instead of resent.
+    expect(await manager.sendImapDraft(imapId, read.draft!.revision)).toMatchObject({
+      success: false,
+      error: expect.stringMatching(/no longer exists/),
+    });
+    expect(smtpSend).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects stale revisions, foreign senders and non-Drafts messages without sending", async () => {
+    const fake = fakeImap();
+    seedDraft(fake);
+    const smtpSend = vi.fn(async () => ({ success: true, messageId: "<x@example.com>" }));
+    const manager = new ImapDraftManager(managerOptions(fake.client, { smtpSend }));
+
+    expect(await manager.sendImapDraft(imapId, "stale")).toMatchObject({
+      success: false,
+      error: expect.stringMatching(/revision conflict/),
+    });
+    expect(await manager.sendImapDraft(encodeImapId("iCloud", "INBOX", 100), "any")).toMatchObject({
+      success: false,
+      error: expect.stringMatching(/not the Drafts mailbox/),
+    });
+
+    const foreign = Buffer.from(raw.toString().replace("sender@example.com", "other@example.com"));
+    seedDraft(fake, foreign);
+    const revision = (await manager.getImapDraft(imapId)).draft!.revision;
+    expect(await manager.sendImapDraft(imapId, revision)).toMatchObject({
+      success: false,
+      error: expect.stringMatching(/not found or is disabled/),
+    });
+    expect(smtpSend).not.toHaveBeenCalled();
+    expect(fake.boxes.get("Drafts")?.size).toBe(1);
+  });
+
+  it("keeps the Drafts copy and blocks retries after an uncertain send", async () => {
+    const fake = fakeImap();
+    seedDraft(fake);
+    const smtpSend = vi.fn(async () => ({
+      success: false,
+      error: "socket closed",
+      uncertain: true,
+    }));
+    const fresh = () => new ImapDraftManager(managerOptions(fake.client, { smtpSend }));
+    const revision = (await fresh().getImapDraft(imapId)).draft!.revision;
+
+    expect((await fresh().sendImapDraft(imapId, revision)).error).toMatch(/verify Sent/i);
+    expect(fake.boxes.get("Drafts")?.size).toBe(1);
+    expect(fake.flags.get(draftUid)?.has(SENDING_KEYWORD)).toBe(true);
+    // Another instance sees the server marker and does not resend.
+    expect(await fresh().sendImapDraft(imapId, revision)).toMatchObject({
+      success: false,
+      error: expect.stringMatching(/avoid a duplicate/i),
+    });
+    expect(smtpSend).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves the draft sendable after a definite rejection", async () => {
+    const fake = fakeImap();
+    seedDraft(fake);
+    const manager = new ImapDraftManager(
+      managerOptions(fake.client, {
+        smtpSend: async () => ({ success: false, error: "550 rejected" }),
+      })
+    );
+    const revision = (await manager.getImapDraft(imapId)).draft!.revision;
+    expect(await manager.sendImapDraft(imapId, revision)).toMatchObject({
+      success: false,
+      error: "550 rejected",
+    });
+    expect(fake.boxes.get("Drafts")?.size).toBe(1);
+    expect(fake.flags.get(draftUid)?.has(SENDING_KEYWORD)).toBe(false);
+    expect((await manager.getImapDraft(imapId)).draft?.deliveryState).toBe("draft");
+  });
+
+  it("routes the imap: ID of a connector draft through its managed send", async () => {
+    const fake = fakeImap();
+    const smtpSend = vi.fn(async () => ({ success: true, messageId: "<m@example.com>" }));
+    const manager = new ImapDraftManager(managerOptions(fake.client, { smtpSend }));
+    const created = await manager.createDraft({ to: ["to@example.com"], subject: "S", body: "B" });
+
+    const sent = await manager.sendImapDraft(created.draft!.nativeId!, created.draft!.revision);
+
+    expect(sent).toMatchObject({ success: true, draft: { draftId: created.draft!.draftId } });
+    expect(smtpSend).toHaveBeenCalledTimes(1);
+    expect((await manager.listDrafts()).drafts).toEqual([]);
+  });
+});

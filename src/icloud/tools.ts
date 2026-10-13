@@ -107,6 +107,15 @@ export function registerIcloudTools(
   const draftId = z
     .string()
     .regex(/^apple-draft:[A-Za-z0-9_-]+$/, "Use a draft ID returned by this connector.");
+  // get_draft and send_draft also take the imap: ID of any message in Drafts.
+  const anyDraftId = () =>
+    z
+      .string()
+      .regex(
+        /^(?:apple-draft|imap):[A-Za-z0-9_-]+$/,
+        "Use a draft ID returned by this connector, or the imap: ID of a message in Drafts."
+      );
+  const isImapId = (value: string) => value.startsWith("imap:");
   // Each field gets its own schema instance: a shared one is emitted as a JSON
   // Schema $ref, which strict host validators may not resolve.
   const email = () => z.string().email();
@@ -525,19 +534,23 @@ export function registerIcloudTools(
   );
   tool(
     "list_managed_drafts",
-    "List drafts created by this connector. To find all other drafts, search the server Drafts mailbox.",
+    "List drafts created by this connector that are still in the server Drafts mailbox. Drafts saved by other mail clients are not listed: search the Drafts mailbox for them; get_draft and send_draft accept their imap: IDs.",
     {},
     true,
     () => drafts.listDrafts()
   );
   tool(
     "get_draft",
-    "Read a connector-managed draft and its current revision before editing/sending.",
+    "Read a draft and its current revision before editing/sending: a connector draft ID, or the imap: ID of any message in the Drafts mailbox.",
     {
-      draftId,
+      draftId: anyDraftId(),
     },
     true,
-    (args) => drafts.getDraft(args.draftId)
+    async (args) => {
+      if (!isImapId(args.draftId)) return drafts.getDraft(args.draftId);
+      checkId(args.draftId);
+      return drafts.getImapDraft(args.draftId);
+    }
   );
   tool(
     "update_draft",
@@ -582,12 +595,16 @@ export function registerIcloudTools(
   );
   tool(
     "send_draft",
-    "Send a reviewed draft through iCloud SMTP and preserve a Sent copy. Requires explicit user instruction to send and the current revision. Never automatically retry an uncertain send.",
+    "Send a reviewed draft through iCloud SMTP, preserve a Sent copy and remove it from Drafts. Takes a connector draft ID, or the imap: ID of a draft another mail client saved in the Drafts mailbox, which is sent exactly as written. Requires explicit user instruction to send and the current revision from get_draft. Never automatically retry an uncertain send.",
     {
-      draftId,
+      draftId: anyDraftId(),
       expectedRevision: z.string().min(1),
     },
     false,
-    (args) => drafts.sendDraft(args.draftId, args.expectedRevision)
+    async (args) => {
+      if (!isImapId(args.draftId)) return drafts.sendDraft(args.draftId, args.expectedRevision);
+      checkId(args.draftId);
+      return drafts.sendImapDraft(args.draftId, args.expectedRevision);
+    }
   );
 }

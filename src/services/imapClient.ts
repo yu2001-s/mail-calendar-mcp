@@ -971,6 +971,14 @@ async function resolveSpecialMailboxPath(
   );
 }
 
+/** The server path of the account's Drafts or Sent mailbox. */
+export function imapSpecialMailboxPath(
+  kind: ImapSpecialMailbox,
+  deps: ImapDeps = {}
+): Promise<string> {
+  return withClient(deps, (client) => resolveSpecialMailboxPath(client, kind));
+}
+
 /**
  * Append one exact RFC 5322 message to the provider's special-use mailbox.
  * lookupHeader is used to recover the UID on servers without UIDPLUS.
