@@ -1,5 +1,5 @@
 {
-  "name": "icloud-mail-mcp",
+  "name": "mail-calendar-mcp",
   "version": "1.6.0",
   "private": true,
   "packageManager": "pnpm@11.9.0",
@@ -40,11 +40,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yu2001-s/apple-mail.git"
+    "url": "git+https://github.com/yu2001-s/mail-calendar-mcp.git"
   },
-  "homepage": "https://github.com/yu2001-s/apple-mail#readme",
+  "homepage": "https://github.com/yu2001-s/mail-calendar-mcp#readme",
   "bugs": {
-    "url": "https://github.com/yu2001-s/apple-mail/issues"
+    "url": "https://github.com/yu2001-s/mail-calendar-mcp/issues"
   },
   "engines": {
     "node": ">=20.0.0"

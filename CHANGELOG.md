@@ -7,6 +7,9 @@
   about once a minute, read-only, and POSTs each new message's headers, never
   its body, to the registered URL, once, with retries and backoff. Gmail
   accounts cannot be watched. See docs/WORKER.md#new-mail-webhooks.
+- The repository is renamed `yu2001-s/mail-calendar-mcp` (package
+  `mail-calendar-mcp`). The Worker (`icloud-mail`), its URL and the
+  `APPLE_MAIL_MCP_*` configuration are unchanged.
 
 ## 1.6.0 — 2026-10-08
 

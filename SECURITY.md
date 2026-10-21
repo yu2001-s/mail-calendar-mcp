@@ -2,7 +2,7 @@
 
 The maintained connector is the Mail & Calendar Cloudflare Worker. Report
 vulnerabilities through
-[GitHub's private vulnerability reporting](https://github.com/yu2001-s/apple-mail/security/advisories/new),
+[GitHub's private vulnerability reporting](https://github.com/yu2001-s/mail-calendar-mcp/security/advisories/new),
 with a description and reproduction steps.
 
 The Worker connects directly to iCloud over IMAP/SMTP and to Google's APIs. It
