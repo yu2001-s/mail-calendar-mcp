@@ -12,11 +12,12 @@ across every account, and one place to link them.
 Added once to a Claude or ChatGPT account, it works in every app and device
 signed in to that account, with nothing installed per machine. Clients that
 can run shell commands, such as Claude Code, can also attach local files
-through one-time upload links.
+through one-time upload links. Agents can also register webhooks that hear
+about new iCloud mail (`mail_listen_set`).
 
 | Guide | |
 | --- | --- |
-| [docs/WORKER.md](docs/WORKER.md) | Deploy, connect clients, attachments, security |
+| [docs/WORKER.md](docs/WORKER.md) | Deploy, connect clients, attachments, new-mail webhooks, security |
 | [docs/GOOGLE.md](docs/GOOGLE.md) | Link Gmail and Google Calendar accounts |
 
 ## Data

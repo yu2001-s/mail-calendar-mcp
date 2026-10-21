@@ -7,13 +7,22 @@
  * across requests, the in-memory draft cache, and the queue that serializes
  * mail operations. The connection closes after a few idle minutes; an open
  * socket keeps the object in memory and is billed by duration.
+ *
+ * The object also runs the new-mail webhooks (src/icloud/listeners.ts): its
+ * alarm polls the watched mailboxes about once a minute while any exist.
  */
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { connectImap, type ImapClientLike, type ImapConnect } from "../services/imapClient.js";
+import {
+  connectImap,
+  resolveImapConfig,
+  type ImapClientLike,
+  type ImapConnect,
+} from "../services/imapClient.js";
 import { loadContext, type ConnectorContext, type Preferences } from "../icloud/context.js";
 import { kvSettingsStore } from "../icloud/settings.js";
 import type { GoogleAccounts } from "../google/accounts.js";
 import { createConnectorServer } from "../mcp/server.js";
+import { MailWatcher, type WatchClient, type WatchStorage } from "../icloud/listeners.js";
 import { googleAccountsFor } from "./accounts.js";
 import { workerUploads } from "./uploads.js";
 import type { Env } from "./index.js";
@@ -90,16 +99,44 @@ export function persistentImap(idleMs = IMAP_IDLE_MS, connect: ImapConnect = con
   return { connect: open, close, isOpen: () => shared !== undefined };
 }
 
+/** The Durable Object state the session uses. */
+export interface SessionState {
+  storage: WatchStorage;
+}
+
 export class MailSession {
   private readonly imap = persistentImap();
   private context?: ConnectorContext;
+  private watcher?: MailWatcher;
   /** Kept with the object so Google access tokens are reused across requests. */
   private google?: GoogleAccounts | null;
 
   constructor(
-    _state: unknown,
-    private readonly env: Env
+    private readonly state: SessionState,
+    private readonly env: Env,
+    private readonly connect: ImapConnect = connectImap
   ) {}
+
+  /** New-mail webhooks; iCloud only. */
+  private mailWatcher(): MailWatcher | undefined {
+    if (!this.env.ICLOUD_MAIL_PREFERENCES || !this.state?.storage) return undefined;
+    const ctx = this.connector();
+    this.watcher ??= new MailWatcher({
+      storage: this.state.storage,
+      imapAccount: ctx.account,
+      primaryAddress: async () => (await ctx.refresh()).primaryAddress,
+      // Its own short-lived connection: polls never disturb the mailbox a tool
+      // call has selected, and the object can sleep between alarms.
+      connect: async () =>
+        (await this.connect(resolveImapConfig(process.env, ctx.account))) as unknown as WatchClient,
+    });
+    return this.watcher;
+  }
+
+  /** Durable Object alarm: one poll of the new-mail webhooks. */
+  async alarm(): Promise<void> {
+    await this.mailWatcher()?.poll();
+  }
 
   private connector(): ConnectorContext {
     this.context ??= loadContext(syncProcessEnv(this.env), {
@@ -123,7 +160,11 @@ export class MailSession {
     await icloud?.refresh();
     const server = await createConnectorServer(
       { icloud, google: this.googleAccounts(origin) },
-      { websiteUrl: `${origin}/`, uploads: workerUploads(this.env, origin) }
+      {
+        websiteUrl: `${origin}/`,
+        uploads: workerUploads(this.env, origin),
+        mailListeners: this.mailWatcher(),
+      }
     );
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

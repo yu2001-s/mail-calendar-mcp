@@ -10,6 +10,11 @@ import { googleInstructions, registerGoogleTools } from "../google/tools.js";
 import { CONNECTOR_DESCRIPTION, CONNECTOR_NAME, CONNECTOR_TITLE } from "./identity.js";
 import { registerTool, toolResult } from "./tooling.js";
 import { registerUploadTool, UPLOAD_INSTRUCTIONS } from "./uploads.js";
+import {
+  MAIL_LISTEN_INSTRUCTIONS,
+  registerMailListenTools,
+  type MailWatcher,
+} from "../icloud/listeners.js";
 
 declare const CONNECTOR_VERSION: string;
 
@@ -20,7 +25,7 @@ export interface ConnectorServices {
 
 export async function createConnectorServer(
   services: ConnectorServices,
-  options: ToolOptions & { websiteUrl?: string } = {}
+  options: ToolOptions & { websiteUrl?: string; mailListeners?: MailWatcher } = {}
 ): Promise<McpServer> {
   const { icloud, google } = services;
   const parts: string[] = [];
@@ -33,6 +38,8 @@ export async function createConnectorServer(
     const linked = await google.summaries().catch(() => []);
     parts.push(googleInstructions(linked, google.manageUrl));
   }
+  const mailListeners = icloud ? options.mailListeners : undefined;
+  if (mailListeners) parts.push(MAIL_LISTEN_INSTRUCTIONS);
   const uploads = icloud || google ? options.uploads : undefined;
   if (uploads) parts.push(UPLOAD_INSTRUCTIONS);
   parts.push(
@@ -50,6 +57,7 @@ export async function createConnectorServer(
   );
   if (icloud) registerIcloudTools(server, icloud, options);
   if (google) registerGoogleTools(server, google, uploads);
+  if (mailListeners) registerMailListenTools(server, mailListeners);
   if (uploads) registerUploadTool(server, uploads);
   registerTool(
     server,

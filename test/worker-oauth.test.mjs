@@ -207,9 +207,9 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
       await rpc(tokens.access_token, { jsonrpc: "2.0", id: 2, method: "tools/list" })
     ).json();
     const names = listed.result.tools.map((tool) => tool.name);
-    // 21 iCloud tools, 29 Gmail, 8 Calendar, list_accounts, set_account_nickname
-    // and create_attachment_upload.
-    assert.equal(names.length, 61, names.join(", "));
+    // 21 iCloud tools, 3 mail_listen_* webhooks, 29 Gmail, 8 Calendar,
+    // list_accounts, set_account_nickname and create_attachment_upload.
+    assert.equal(names.length, 64, names.join(", "));
     for (const name of [
       "create_attachment_upload",
       "search_messages",
@@ -217,6 +217,9 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
       "gmail_reply",
       "calendar_list_events",
       "list_accounts",
+      "mail_listen_set",
+      "mail_listen_list",
+      "mail_listen_remove",
     ]) {
       assert(names.includes(name), `${name} is listed`);
     }

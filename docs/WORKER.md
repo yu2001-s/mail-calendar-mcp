@@ -120,6 +120,52 @@ upload again. A draft that fails keeps its uploads, so the same `uploadId` can
 be retried. A lifecycle rule set by `setup-worker.mjs` deletes anything left,
 markers included, after a day.
 
+## New-mail webhooks
+
+`mail_listen_set {name, url, account?, mailboxes?, headers?}` registers a
+webhook for new iCloud mail; `mail_listen_list` and `mail_listen_remove {name}`
+manage them, like the LINE connector's `line_listen_*` tools. Setting an
+existing name replaces that listener.
+
+A Worker cannot keep an IMAP IDLE connection open, so the `MailSession`
+Durable Object polls instead: while any listener exists, an alarm fires about
+every 60 seconds, opens a short-lived IMAP connection, `EXAMINE`s each watched
+mailbox (read-only, so no flag, `\Seen` included, can change) and fetches only
+the envelopes of messages above the last UID delivered. Each new message is
+POSTed to the listener's `url` with its `headers`:
+
+```json
+{
+  "text": "New mail in INBOX from Ann: Hello",
+  "listener": "courier",
+  "account": "me@example.com",
+  "mailbox": "INBOX",
+  "message": {
+    "id": "imap:…",
+    "rfcMessageId": "<…@example.com>",
+    "inReplyTo": null,
+    "from": { "name": "Ann", "address": "ann@example.com" },
+    "to": [{ "name": null, "address": "me@example.com" }],
+    "subject": "Hello",
+    "date": "2026-10-21T09:00:00.000Z"
+  }
+}
+```
+
+`message.id` is the ID `read_message` and `create_reply_draft` take. Bodies
+are never sent. The last UID and UIDVALIDITY are stored per listener and
+mailbox in Durable Object storage, so each message is sent once and restarts
+never replay mail; a new or replaced listener starts after the newest message,
+and a UIDVALIDITY change starts over the same way without firing. A delivery
+that fails (non-2xx or a network error) is retried on later polls with
+exponential backoff (1, 2, 4 … up to 30 minutes), holding back later messages
+for that listener so they arrive in order; after 8 attempts the message is
+skipped and logged. Only the iCloud account (its primary address) can be
+watched, in `INBOX` and optionally `Junk` for bounces; Gmail accounts are
+refused. The iCloud inbox holds mail for every address on the account, so a
+listener hears all of them. Webhook URLs must be https; `mail_listen_list`
+shows header names but not their values.
+
 ## Security
 
 - `@cloudflare/workers-oauth-provider` implements OAuth 2.1: PKCE, single-use

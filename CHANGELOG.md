@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- New-mail webhooks for iCloud: `mail_listen_set`, `mail_listen_list` and
+  `mail_listen_remove`. The Durable Object polls INBOX (and Junk, if asked)
+  about once a minute, read-only, and POSTs each new message's headers, never
+  its body, to the registered URL, once, with retries and backoff. Gmail
+  accounts cannot be watched. See docs/WORKER.md#new-mail-webhooks.
+
 ## 1.6.0 — 2026-10-08
 
 - The Cloudflare Worker is now the only way to run the connector. The local
