@@ -97,4 +97,34 @@ describe("draft MIME composition", () => {
     expect(raw.toString()).toMatch(/Subject: =\?UTF-8\?Q\?.+\r?\n =\?UTF-8\?Q\?/);
     expect(parseDraftMime(raw).subject).toBe(subject);
   });
+
+  it("decodes a Big5 original's subject, sender and body for quoting in a reply", () => {
+    // 「回覆: 醫療減負合作交流」, 「醫療減負」 and 「請問您我的連絡方式是由那位人員提供或連繫」 in Big5.
+    const subject = Buffer.from("a65ec2d03a20c2e5c0f8b4eead74a658a740a5e6ac79", "hex");
+    const name = Buffer.from("c2e5c0f8b4eead74", "hex");
+    const body = Buffer.from(
+      "bdd0b0ddb17aa7daaabab373b5b8a4e8a6a1ac4fa5d1a8baa6eca448adfbb4a3a8d1a9ceb373c3b4",
+      "hex"
+    );
+    const nameQ = [...name].map((b) => `=${b.toString(16).toUpperCase()}`).join("");
+    const raw = Buffer.concat([
+      Buffer.from(
+        [
+          `From: =?big5?Q?${nameQ}?= <director@hospital.example.tw>`,
+          `Subject: =?big5?B?${subject.toString("base64")}?=`,
+          "Message-ID: <big5@hospital.example.tw>",
+          'Content-Type: text/plain; charset="big5"',
+          "Content-Transfer-Encoding: 8bit",
+          "",
+          "",
+        ].join("\r\n")
+      ),
+      body,
+    ]);
+    expect(parseDraftMime(raw)).toMatchObject({
+      from: "醫療減負 <director@hospital.example.tw>",
+      subject: "回覆: 醫療減負合作交流",
+      body: "請問您我的連絡方式是由那位人員提供或連繫",
+    });
+  });
 });

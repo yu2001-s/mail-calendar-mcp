@@ -404,7 +404,7 @@ interface MsgRec {
   deleted?: number[];
 }
 
-function makeMsgClient(rec: MsgRec, source?: string): ImapClientLike {
+function makeMsgClient(rec: MsgRec, source?: string | Buffer): ImapClientLike {
   const base = makeClient([], {});
   return {
     ...base,
@@ -413,7 +413,13 @@ function makeMsgClient(rec: MsgRec, source?: string): ImapClientLike {
       return { release: () => undefined };
     },
     fetchOne: async () =>
-      source ? { uid: 1, envelope: { subject: "Hello" }, source: Buffer.from(source) } : false,
+      source
+        ? {
+            uid: 1,
+            envelope: { subject: "Hello" },
+            source: typeof source === "string" ? Buffer.from(source) : source,
+          }
+        : false,
     messageFlagsAdd: async (_r: number[], flags: string[]) => {
       rec.flagsAdded = flags;
       return true;
@@ -513,6 +519,27 @@ describe("IMAP message mutations (#43 Phase 3)", () => {
     expect(r.success).toBe(true);
     expect(r.info).toContain("Subject: Hello");
     expect(r.info).toContain("Hello body line");
+  });
+
+  it("reads an 8bit Big5 body in its declared charset", async () => {
+    // 「請問您我的連絡方式是由那位人員提供或連繫」 as an Outlook reply sent it.
+    const big5 = Buffer.from(
+      "bdd0b0ddb17aa7daaabab373b5b8a4e8a6a1ac4fa5d1a8baa6eca448adfbb4a3a8d1a9ceb373c3b4",
+      "hex"
+    );
+    const source = Buffer.concat([
+      Buffer.from(
+        'Content-Type: text/plain; charset="big5"\r\nContent-Transfer-Encoding: 8bit\r\n\r\n'
+      ),
+      big5,
+    ]);
+    const deps = { config: cfg, connect: async () => makeMsgClient({}, source) };
+    expect((await imapReadMessage(MID, false, deps)).message?.textBody).toBe(
+      "請問您我的連絡方式是由那位人員提供或連繫"
+    );
+    expect((await imapGetMessage(MID, false, deps)).info).toContain(
+      "請問您我的連絡方式是由那位人員提供或連繫"
+    );
   });
 
   it("read-message returns a complete resource and only exposes raw MIME on request", async () => {

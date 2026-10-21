@@ -4,6 +4,7 @@ import {
   extractMimeAttachment,
   extractHtmlBody,
   extractRfcMessageIdFromSource,
+  extractTextBody,
 } from "./mimeParse.js";
 
 describe("extractRfcMessageIdFromSource", () => {
@@ -381,6 +382,180 @@ just text, no html`;
 
   it("returns null for empty input", () => {
     expect(extractHtmlBody("")).toBeNull();
+  });
+});
+
+// A real reply from Outlook for iOS, in Big5: 「請問您我的連絡方式是由那位人員提供或連繫」.
+// Read as UTF-8 it came back from read_message as OUTLOOK_MOJIBAKE.
+const OUTLOOK_TEXT = "請問您我的連絡方式是由那位人員提供或連繫";
+const OUTLOOK_BIG5 = Buffer.from(
+  "bdd0b0ddb17aa7daaabab373b5b8a4e8a6a1ac4fa5d1a8baa6eca448adfbb4a3a8d1a9ceb373c3b4",
+  "hex"
+);
+const OUTLOOK_MOJIBAKE = "�аݱz�ڪ��s���覡�O�Ѩ���H�����ѩγsô";
+const OUTLOOK_HTML = `<div dir="ltr">${OUTLOOK_TEXT}</div>`;
+const OUTLOOK_HTML_BIG5 = Buffer.concat([
+  Buffer.from('<div dir="ltr">'),
+  OUTLOOK_BIG5,
+  Buffer.from("</div>"),
+]);
+
+/** Raw MIME bytes: CRLF-terminated ASCII lines around raw body bytes. */
+function mimeBytes(...pieces: Array<string | Buffer>): Buffer {
+  return Buffer.concat(
+    pieces.map((piece) =>
+      typeof piece === "string" ? Buffer.from(piece.replace(/\n/g, "\r\n"), "latin1") : piece
+    )
+  );
+}
+
+function base64Lines(bytes: Buffer): string {
+  return bytes
+    .toString("base64")
+    .match(/.{1,76}/g)!
+    .join("\n");
+}
+
+/** Quoted-printable with every byte escaped, broken by soft line breaks. */
+function quotedPrintable(bytes: Buffer): string {
+  const escaped = [...bytes].map((b) => `=${b.toString(16).toUpperCase().padStart(2, "0")}`);
+  const lines: string[] = [];
+  for (let i = 0; i < escaped.length; i += 24) lines.push(escaped.slice(i, i + 24).join(""));
+  return lines.join("=\n");
+}
+
+const TRANSFER_ENCODINGS: Record<string, (bytes: Buffer) => string | Buffer> = {
+  base64: base64Lines,
+  "quoted-printable": quotedPrintable,
+  "8bit": (bytes) => bytes,
+};
+
+describe("body charsets", () => {
+  it("reproduces the reported mojibake when the Big5 sample is read as UTF-8", () => {
+    expect(new TextDecoder("utf-8").decode(OUTLOOK_BIG5)).toBe(OUTLOOK_MOJIBAKE);
+  });
+
+  it("decodes the Outlook for iOS Big5 reply (multipart/alternative, base64)", () => {
+    const src = mimeBytes(`From: =?big5?B?pKSk5Q==?= <director@hospital.example.tw>
+Content-Type: multipart/alternative;
+\tboundary="_000_SEZPR01MB0001_"
+MIME-Version: 1.0
+
+--_000_SEZPR01MB0001_
+Content-Type: text/plain; charset="big5"
+Content-Transfer-Encoding: base64
+
+${base64Lines(OUTLOOK_BIG5)}
+
+--_000_SEZPR01MB0001_
+Content-Type: text/html; charset="big5"
+Content-Transfer-Encoding: base64
+
+${base64Lines(OUTLOOK_HTML_BIG5)}
+
+--_000_SEZPR01MB0001_--
+`);
+    expect(extractTextBody(src)).toBe(OUTLOOK_TEXT);
+    expect(extractHtmlBody(src)).toBe(OUTLOOK_HTML);
+    // A base64 body is ASCII, so the same message as a decoded string agrees.
+    expect(extractTextBody(src.toString("utf8"))).toBe(OUTLOOK_TEXT);
+  });
+
+  for (const [encoding, encode] of Object.entries(TRANSFER_ENCODINGS)) {
+    it(`decodes a single-part Big5 text/plain body sent ${encoding}`, () => {
+      const src = mimeBytes(
+        `Content-Type: text/plain; charset=Big5
+Content-Transfer-Encoding: ${encoding}
+
+`,
+        encode(OUTLOOK_BIG5)
+      );
+      expect(extractTextBody(src)).toBe(OUTLOOK_TEXT);
+    });
+
+    it(`decodes a single-part Big5 text/html body sent ${encoding}`, () => {
+      const src = mimeBytes(
+        `Content-Type: text/html; charset="big5"
+Content-Transfer-Encoding: ${encoding}
+
+`,
+        encode(OUTLOOK_HTML_BIG5)
+      );
+      expect(extractHtmlBody(src)).toBe(OUTLOOK_HTML);
+    });
+  }
+
+  it("decodes each part of a multipart/alternative in its own charset", () => {
+    const src = mimeBytes(
+      `Content-Type: multipart/alternative; boundary="alt"
+
+--alt
+Content-Type: text/plain; charset="big5"
+Content-Transfer-Encoding: 8bit
+
+`,
+      OUTLOOK_BIG5,
+      `
+--alt
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+${quotedPrintable(Buffer.from(OUTLOOK_HTML))}
+--alt--
+`
+    );
+    expect(extractTextBody(src)).toBe(OUTLOOK_TEXT);
+    expect(extractHtmlBody(src)).toBe(OUTLOOK_HTML);
+  });
+
+  it.each([
+    ["gb18030", "c7ebceca", "请问"],
+    ["shift_jis", "82a896e282a28d8782ed82b9", "お問い合わせ"],
+    ["euc-kr", "b9aec0c7", "문의"],
+    ["iso-8859-1", "636166e9", "café"],
+  ])("decodes a %s body", (charset, hex, text) => {
+    const src = mimeBytes(
+      `Content-Type: text/plain; charset=${charset}
+Content-Transfer-Encoding: 8bit
+
+`,
+      Buffer.from(hex, "hex")
+    );
+    expect(extractTextBody(src)).toBe(text);
+  });
+
+  it("falls back to UTF-8 for a part with no charset", () => {
+    const src = mimeBytes(
+      `Content-Type: multipart/mixed; boundary="m"
+
+--m
+Content-Type: text/plain
+Content-Transfer-Encoding: 8bit
+
+`,
+      Buffer.from("請問您"),
+      `
+--m--
+`
+    );
+    expect(extractTextBody(src)).toBe("請問您");
+  });
+
+  it("falls back to UTF-8 for a charset the runtime does not know", () => {
+    const src = mimeBytes(`Content-Type: text/html; charset="x-no-such-charset"
+Content-Transfer-Encoding: base64
+
+${base64Lines(Buffer.from("<p>請問您</p>"))}
+`);
+    expect(extractHtmlBody(src)).toBe("<p>請問您</p>");
+  });
+
+  it("returns an 8bit body from an already-decoded string as is", () => {
+    const src = `Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+請問您`;
+    expect(extractTextBody(src)).toBe("請問您");
   });
 });
 

@@ -8,6 +8,8 @@
  * @module utils/mimeParse
  */
 
+import { contentTypeCharset, decodeCharset } from "./charset.js";
+
 export interface MimeAttachmentInfo {
   /** Filename from Content-Disposition or Content-Type name parameter */
   name: string;
@@ -280,6 +282,26 @@ export function parseMimeAttachmentData(source: string): MimeAttachmentData[] {
 }
 
 /**
+ * Raw MIME as fetched from the server, or text a caller already decoded from
+ * it. A Buffer is read one char per byte (latin1), so an 8bit body keeps its
+ * exact bytes until it is decoded in its own charset.
+ */
+export type MimeSource = Buffer | string;
+
+/**
+ * Decode a text part in its declared charset, or UTF-8 when it names none or
+ * one the runtime doesn't know. A string source was already decoded, so its
+ * 7bit/8bit parts have no bytes left to reinterpret and are returned as is.
+ */
+function decodeTextPart(headers: string, body: string, fromBytes: boolean): string {
+  const encoding = getMimeHeader(headers, "Content-Transfer-Encoding");
+  const enc = (encoding || "").toLowerCase().trim();
+  if (!fromBytes && enc !== "base64" && enc !== "quoted-printable") return body;
+  const charset = contentTypeCharset(getMimeHeader(headers, "Content-Type"));
+  return decodeCharset(decodeBody(body, encoding), charset);
+}
+
+/**
  * Extract the decoded `text/html` body from raw MIME source.
  *
  * Used by get-message's `preferHtml` path so it returns the actual HTML body
@@ -287,35 +309,37 @@ export function parseMimeAttachmentData(source: string): MimeAttachmentData[] {
  * both wrong and enormous (#32). Handles both multipart messages (walks leaf
  * parts, descending into nested multipart/* containers) and a non-multipart
  * message whose top-level Content-Type is text/html. Bodies are decoded per
- * Content-Transfer-Encoding (base64 / quoted-printable / raw) and returned as
- * UTF-8 text.
+ * Content-Transfer-Encoding (base64 / quoted-printable / raw), then from the
+ * part's declared charset (Big5, GB18030, Shift_JIS, ...; UTF-8 by default).
  *
- * @param source - Raw MIME source of the email
+ * @param source - Raw MIME source of the email; pass the fetched Buffer so
+ *   8bit bodies can be decoded in their charset too
  * @returns The decoded HTML body, or null if the message has no text/html part
  */
-export function extractHtmlBody(source: string): string | null {
-  if (!source || !source.trim()) return null;
+export function extractHtmlBody(source: MimeSource): string | null {
+  if (!source) return null;
+  const fromBytes = typeof source !== "string";
+  const text = fromBytes ? source.toString("latin1") : source;
+  if (!text.trim()) return null;
 
-  const boundary = extractBoundary(source);
+  const boundary = extractBoundary(text);
 
   if (boundary) {
-    for (const part of walkLeafParts(source, boundary)) {
+    for (const part of walkLeafParts(text, boundary)) {
       if (extractMimeType(part.headers) === "text/html") {
-        const encoding = getMimeHeader(part.headers, "Content-Transfer-Encoding");
-        return decodeBody(part.body, encoding).toString("utf8");
+        return decodeTextPart(part.headers, part.body, fromBytes);
       }
     }
     return null;
   }
 
   // Non-multipart: split top headers from body and check the top Content-Type.
-  const blankLineIdx = source.search(/\r?\n\r?\n/);
+  const blankLineIdx = text.search(/\r?\n\r?\n/);
   if (blankLineIdx === -1) return null;
-  const headers = source.substring(0, blankLineIdx);
+  const headers = text.substring(0, blankLineIdx);
   if (extractMimeType(headers) !== "text/html") return null;
-  const body = source.substring(blankLineIdx).replace(/^\r?\n\r?\n/, "");
-  const encoding = getMimeHeader(headers, "Content-Transfer-Encoding");
-  return decodeBody(body, encoding).toString("utf8");
+  const body = text.substring(blankLineIdx).replace(/^\r?\n\r?\n/, "");
+  return decodeTextPart(headers, body, fromBytes);
 }
 
 /**
@@ -323,29 +347,30 @@ export function extractHtmlBody(source: string): string | null {
  * extractHtmlBody; used by the IMAP get-message path (#43 Phase 3) to render a
  * message fetched by UID. Returns null when there's no text/plain part.
  */
-export function extractTextBody(source: string): string | null {
-  if (!source || !source.trim()) return null;
+export function extractTextBody(source: MimeSource): string | null {
+  if (!source) return null;
+  const fromBytes = typeof source !== "string";
+  const text = fromBytes ? source.toString("latin1") : source;
+  if (!text.trim()) return null;
 
-  const boundary = extractBoundary(source);
+  const boundary = extractBoundary(text);
   if (boundary) {
-    for (const part of walkLeafParts(source, boundary)) {
+    for (const part of walkLeafParts(text, boundary)) {
       if (extractMimeType(part.headers) === "text/plain") {
-        const encoding = getMimeHeader(part.headers, "Content-Transfer-Encoding");
-        return decodeBody(part.body, encoding).toString("utf8");
+        return decodeTextPart(part.headers, part.body, fromBytes);
       }
     }
     return null;
   }
 
   // Non-multipart: treat as text/plain unless the Content-Type says otherwise.
-  const blankLineIdx = source.search(/\r?\n\r?\n/);
+  const blankLineIdx = text.search(/\r?\n\r?\n/);
   if (blankLineIdx === -1) return null;
-  const headers = source.substring(0, blankLineIdx);
+  const headers = text.substring(0, blankLineIdx);
   const ct = extractMimeType(headers);
   if (ct !== "text/plain" && getMimeHeader(headers, "Content-Type") !== null) return null;
-  const body = source.substring(blankLineIdx).replace(/^\r?\n\r?\n/, "");
-  const encoding = getMimeHeader(headers, "Content-Transfer-Encoding");
-  return decodeBody(body, encoding).toString("utf8");
+  const body = text.substring(blankLineIdx).replace(/^\r?\n\r?\n/, "");
+  return decodeTextPart(headers, body, fromBytes);
 }
 
 /**

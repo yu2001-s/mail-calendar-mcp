@@ -2,6 +2,7 @@ import { createHash } from "crypto";
 import nodemailer from "nodemailer";
 import type { Attachment, AttachmentInput } from "@/types.js";
 import { decodeInlineAttachment } from "@/utils/attachmentLimits.js";
+import { decodeCharset } from "@/utils/charset.js";
 import {
   extractHtmlBody,
   extractRfcMessageIdFromSource,
@@ -65,17 +66,19 @@ export function decodeHeaderWord(value: string): string {
     /=\?([^?]+)\?([bq])\?([^?]+)\?=/gi,
     (_whole, charset: string, encoding: string, encoded: string) => {
       try {
-        if (encoding.toLowerCase() === "b") {
-          return Buffer.from(encoded, "base64").toString(
-            charset.toLowerCase() === "utf-8" ? "utf8" : "latin1"
-          );
-        }
-        const bytes = encoded
-          .replace(/_/g, " ")
-          .replace(/=([0-9a-f]{2})/gi, (_m, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
-        return Buffer.from(bytes, "binary").toString(
-          charset.toLowerCase() === "utf-8" ? "utf8" : "latin1"
-        );
+        const bytes =
+          encoding.toLowerCase() === "b"
+            ? Buffer.from(encoded, "base64")
+            : Buffer.from(
+                encoded
+                  .replace(/_/g, " ")
+                  .replace(/=([0-9a-f]{2})/gi, (_m, hex) =>
+                    String.fromCharCode(Number.parseInt(hex, 16))
+                  ),
+                "binary"
+              );
+        // RFC 2231 allows a language after the charset: =?big5*zh-TW?B?...?=
+        return decodeCharset(bytes, charset.split("*")[0]);
       } catch {
         return encoded;
       }
@@ -162,8 +165,8 @@ export function parseDraftMime(raw: Buffer | string): ParsedDraftMime {
     cc: splitAddresses(getMimeHeader(headers, "Cc")),
     bcc: splitAddresses(getMimeHeader(headers, "Bcc")),
     subject: decodeHeaderWord(getMimeHeader(headers, "Subject") ?? ""),
-    body: extractTextBody(source) ?? "",
-    htmlBody: extractHtmlBody(source) ?? undefined,
+    body: extractTextBody(raw) ?? "",
+    htmlBody: extractHtmlBody(raw) ?? undefined,
     messageId: extractRfcMessageIdFromSource(source) || undefined,
     inReplyTo: getMimeHeader(headers, "In-Reply-To") ?? undefined,
     references: getMimeHeader(headers, "References")?.match(/<[^<>\s]+>/g) ?? undefined,

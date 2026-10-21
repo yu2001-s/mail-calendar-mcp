@@ -12,6 +12,7 @@ import {
   withSubjectPrefix,
 } from "../services/replyForward.js";
 import { decodeInlineAttachment, MAX_INLINE_ATTACHMENT_BYTES } from "../utils/attachmentLimits.js";
+import { contentTypeCharset, decodeCharset } from "../utils/charset.js";
 import { escapeHtml } from "../utils/escapeHtml.js";
 import { htmlToText } from "../utils/htmlText.js";
 
@@ -155,13 +156,7 @@ function header(headers: GmailHeader[] | undefined, name: string): string | unde
 }
 
 function decodeBody(data: string, contentType: string | undefined): string {
-  const bytes = Buffer.from(data, "base64url");
-  const charset = /charset\s*=\s*"?([^";\s]+)"?/i.exec(contentType ?? "")?.[1] ?? "utf-8";
-  try {
-    return new TextDecoder(charset).decode(bytes);
-  } catch {
-    return new TextDecoder("utf-8").decode(bytes);
-  }
+  return decodeCharset(Buffer.from(data, "base64url"), contentTypeCharset(contentType));
 }
 
 /** Walk a message payload into its text bodies and attachments. */

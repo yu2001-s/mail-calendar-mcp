@@ -1167,7 +1167,8 @@ export async function imapGetMessage(
     if (!msg)
       return { success: false, error: `IMAP message UID ${ref.uid} not found in "${ref.path}".` };
     const subject = msg.envelope?.subject || "(no subject)";
-    const src = msg.source ? msg.source.toString() : "";
+    // The fetched bytes, not a UTF-8 string, so bodies decode in their own charset.
+    const src = msg.source ?? "";
     const body =
       (preferHtml ? extractHtmlBody(src) : extractTextBody(src)) ??
       extractTextBody(src) ??
@@ -1209,7 +1210,6 @@ export async function imapReadMessage(
         error: `IMAP message UID ${ref.uid} not found in "${ref.path}".`,
       };
     }
-    const source = msg.source ? msg.source.toString() : "";
     const attachments = msg.bodyStructure
       ? collectAttachments(msg.bodyStructure).map((attachment, index) => ({
           id: `${id}#${attachment.part || index}`,
@@ -1232,14 +1232,14 @@ export async function imapReadMessage(
       bcc: formatAddresses(msg.envelope?.bcc),
       subject: msg.envelope?.subject || "(no subject)",
       date: msg.envelope?.date ? new Date(msg.envelope.date).toISOString() : undefined,
-      textBody: extractTextBody(source) ?? "",
-      htmlBody: extractHtmlBody(source) ?? undefined,
+      textBody: extractTextBody(msg.source ?? "") ?? "",
+      htmlBody: extractHtmlBody(msg.source ?? "") ?? undefined,
       attachments,
       flags: {
         isRead: msg.flags?.has("\\Seen") ?? false,
         isFlagged: msg.flags?.has("\\Flagged") ?? false,
       },
-      ...(includeRawMime ? { rawMime: source } : {}),
+      ...(includeRawMime ? { rawMime: msg.source ? msg.source.toString() : "" } : {}),
     };
     return { success: true, message };
   });
