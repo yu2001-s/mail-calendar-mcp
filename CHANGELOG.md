@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The server instructions and `gmail_create_draft` now say that a reviewed
+  Gmail draft is sent with `gmail_send_message` and its `draftId`. Without
+  this, a host looking for a way to send the draft found only the iCloud
+  `send_draft` and resent the text as a new message instead.
 - New-mail webhooks for iCloud: `mail_listen_set`, `mail_listen_list` and
   `mail_listen_remove`. The Durable Object polls INBOX (and Junk, if asked)
   about once a minute, read-only, and POSTs each new message's headers, never
