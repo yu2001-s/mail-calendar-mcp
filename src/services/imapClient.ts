@@ -637,6 +637,8 @@ export interface ImapOpResult {
   success: boolean;
   error?: string;
   info?: string;
+  /** A moved message's ID in its new mailbox, when the server reports its UID. */
+  id?: string;
 }
 
 function errText(e: unknown): string {
@@ -1352,8 +1354,14 @@ export async function imapMoveMessageById(
       (await findMailboxPath(client, destMailbox)) ?? resolveMailboxPath(destMailbox, "list");
     const lock = await client.getMailboxLock(ref.path);
     try {
-      await client.messageMove([ref.uid], destPath, { uid: true });
-      return { success: true, info: `Moved UID ${ref.uid} to "${destPath}" via IMAP.` };
+      const moved = (await client.messageMove([ref.uid], destPath, { uid: true })) as
+        { uidMap?: Map<number, number> } | false;
+      const uid = moved ? moved.uidMap?.get(ref.uid) : undefined;
+      return {
+        success: true,
+        info: `Moved UID ${ref.uid} to "${destPath}" via IMAP.`,
+        ...(uid && { id: encodeImapId(ref.account, destPath, uid) }),
+      };
     } catch (e) {
       return {
         success: false,
@@ -1518,7 +1526,7 @@ export async function imapListAttachments(
   });
 }
 
-/** Fetch one attachment's bytes (base64) via IMAP, matched by filename. */
+/** Fetch one attachment's bytes (base64) via IMAP, matched by filename or MIME part number. */
 export async function imapFetchAttachment(
   id: string,
   attachmentName: string,
@@ -1538,7 +1546,9 @@ export async function imapFetchAttachment(
       return { success: false, error: `IMAP message UID ${ref.uid} not found in "${ref.path}".` };
     }
     const atts = collectAttachments(msg.bodyStructure);
-    const match = atts.find((a) => a.filename === attachmentName);
+    const match =
+      atts.find((a) => a.filename === attachmentName) ??
+      atts.find((a) => a.part === attachmentName);
     if (!match) {
       const names = atts.map((a) => a.filename).join(", ") || "none";
       return {

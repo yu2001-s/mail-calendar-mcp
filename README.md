@@ -5,9 +5,9 @@ mail directly over IMAP/SMTP, creates synchronized drafts, resolves threaded
 replies, and applies saved sender signatures. It does not launch Mail.app or
 use AppleScript.
 
-The same connector serves any number of Gmail and Google Calendar accounts:
-Gmail tools that match Google's own Gmail connector, calendar tools that work
-across every account, and one place to link them.
+The same connector serves any number of Gmail and Google Calendar accounts.
+One set of `mail_*` tools works the same for iCloud and every Gmail account,
+calendar tools work across every account, and one page links them.
 
 Added once to a Claude or ChatGPT account, it works in every app and device
 signed in to that account, with nothing installed per machine. Clients that
@@ -20,6 +20,27 @@ about new iCloud mail (`mail_listen_set`).
 | [docs/WORKER.md](docs/WORKER.md) | Deploy, connect clients, attachments, new-mail webhooks, security |
 | [docs/GOOGLE.md](docs/GOOGLE.md) | Link Gmail and Google Calendar accounts |
 
+## Mail tools
+
+Every ID names its account (`imap:…` and `apple-draft:…` for iCloud,
+`gmail:<kind>:<address>:<id>` for Gmail), so a message found anywhere is read,
+answered and moved without naming the account again, and a draft's `from`
+address picks the account it is sent from.
+
+| Tool | |
+| --- | --- |
+| `mail_search` | every account at once, or some; inbox by default, any folder or label, newest first, one cursor for more |
+| `mail_read` | a message, a Gmail thread, or a draft with its revision; attachment IDs |
+| `mail_get_attachment` | base64, up to 20 MiB |
+| `mail_create_draft` | a new message, a reply (`replyTo`) or a forward (`forward`, with attachments); saved signatures added |
+| `mail_update_draft` | merge update, given the current revision |
+| `mail_send` | a draft as saved, given its current revision |
+| `mail_list_drafts`, `mail_delete_draft` | |
+| `mail_update` | read, flag, Gmail labels, and moves to inbox, archive, junk, trash or a folder |
+| `mail_list_folders`, `mail_manage_folder` | iCloud mailboxes and Gmail labels |
+| `mail_settings` | primary address, iCloud sending addresses, display names, signatures |
+| `mail_health_check` | every account's sign-in, sending nothing |
+
 ## Data
 
 Account passwords and preferences are Worker secrets, uploaded by
@@ -27,8 +48,8 @@ Account passwords and preferences are Worker secrets, uploaded by
 [docs/WORKER.md](docs/WORKER.md#deploy)). The primary address, sending
 addresses, signatures and display names live in the Worker's KV, seeded on
 first use and edited from chat. iCloud has no API for its alias settings, so
-`list_sending_addresses` adds addresses found in Sent and suggests
-custom-domain recipients from the inbox.
+`mail_settings` adds addresses found in Sent and suggests custom-domain
+recipients from the inbox.
 
 Drafts live on iCloud: each managed draft carries its ID in a header, so every
 client sees the same drafts, revisions and send state.

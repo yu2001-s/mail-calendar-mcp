@@ -187,8 +187,14 @@ export function applySettingsUpdate(settings: Settings, update: SettingsUpdate):
 }
 
 /** Set or, with an empty signature, clear the signature of one sending address. */
-export function applySignature(settings: Settings, from: string, signature: string): Settings {
-  const address = settings.addresses.find((item) => sameAddress(item, from));
+/** `others`: sending addresses outside iCloud, such as linked Gmail accounts, that may have one too. */
+export function applySignature(
+  settings: Settings,
+  from: string,
+  signature: string,
+  others: string[] = []
+): Settings {
+  const address = [...settings.addresses, ...others].find((item) => sameAddress(item, from));
   if (!address) throw new Error(`"${from}" is not a sending address.`);
   const signatures = Object.fromEntries(
     Object.entries(settings.signatures).filter(([key]) => !sameAddress(key, address))

@@ -406,6 +406,15 @@ interface ReplyContext {
   html: (htmlBody: string) => string;
 }
 
+interface ForwardArgs {
+  messageId: string;
+  to?: string[];
+  cc?: string[];
+  bcc?: string[];
+  forwardText?: string;
+  htmlBody?: string;
+}
+
 function same(a: string, b: string): boolean {
   return a.toLowerCase() === b.toLowerCase();
 }
@@ -473,6 +482,75 @@ export class Gmail {
     return formatSender(list.find((item) => item.isDefault) ?? list[0]);
   }
 
+  /** The From header for one of the account's send-as addresses, or its default. */
+  async senderFor(account: string, address?: string): Promise<string> {
+    if (!address) return this.defaultSender(account);
+    const alias = (await this.sendAs(account)).find((item) => same(item.sendAsEmail, address));
+    if (!alias) throw new Error(`${address} is not a send-as address of ${account}.`);
+    return formatSender(alias);
+  }
+
+  async profile(account: string): Promise<{ emailAddress: string; messagesTotal?: number }> {
+    return this.get(account, "profile");
+  }
+
+  /** Messages, not threads, matching a Gmail query, newest first, in the MINIMAL view. */
+  async searchMessages(
+    account: string,
+    args: { query?: string; pageSize?: number; pageToken?: string }
+  ) {
+    let query = args.query?.trim() ?? "";
+    if (!/\bin:(draft|drafts|anywhere)\b/i.test(query)) query = `${query} -in:draft`.trim();
+    const list = await this.get(account, "messages", {
+      q: query,
+      maxResults: args.pageSize ?? 20,
+      pageToken: args.pageToken,
+      includeSpamTrash: /\bin:(trash|spam|anywhere)\b/i.test(query) || undefined,
+    });
+    const ids: string[] = (list.messages ?? []).map((message: { id: string }) => message.id);
+    const headers = SUMMARY_HEADERS.map((name) => `metadataHeaders=${name}`).join("&");
+    const responses = await this.accounts.batch(
+      account,
+      BATCH,
+      ids.map((id) => ({
+        method: "GET" as const,
+        path: `/gmail/v1/users/me/messages/${id}?format=metadata&${headers}`,
+      }))
+    );
+    return {
+      account,
+      messages: responses.map((response, index) =>
+        response.status === 200
+          ? messageView(account, response.body, "MINIMAL")
+          : { id: ids[index], error: response.body?.error?.message ?? `HTTP ${response.status}` }
+      ),
+      nextPageToken: (list.nextPageToken as string | undefined) ?? null,
+    };
+  }
+
+  /** Label IDs for label names or IDs; system labels such as INBOX match in any case. */
+  async labelIdsFor(account: string, names: string[]): Promise<string[]> {
+    if (!names.length) return [];
+    const labels: Array<{ id: string; name: string; type?: string }> =
+      (await this.get(account, "labels")).labels ?? [];
+    return names.map((name) => {
+      const found = labels.find((label) => label.id === name || same(label.name, name));
+      if (found) return found.id;
+      const own = labels.filter((label) => label.type === "user").map((label) => label.name);
+      throw new Error(
+        `${account} has no label "${name}". Its labels: ${own.join(", ") || "none"}.`
+      );
+    });
+  }
+
+  /** A draft's revision: the ID of its current message, which every update replaces. */
+  async draftRevision(account: string, draftId: string): Promise<string> {
+    const draft = await this.get(account, `drafts/${encodeURIComponent(draftId)}`, {
+      format: "minimal",
+    });
+    return draft.message.id;
+  }
+
   async searchThreads(
     account: string,
     args: {
@@ -532,8 +610,7 @@ export class Gmail {
   }
 
   async getThread(account: string, threadId: string, format: MessageFormat, maxBodyChars?: number) {
-    if (format === "RAW")
-      throw new Error("RAW is not supported for threads; use gmail_get_message.");
+    if (format === "RAW") throw new Error("RAW is not supported for threads; read one message.");
     const metadata = format === "MINIMAL" || format === "METADATA_ONLY";
     const thread = await this.get(account, `threads/${encodeURIComponent(threadId)}`, {
       format: metadata ? "metadata" : "full",
@@ -562,7 +639,7 @@ export class Gmail {
   ) {
     const message = await this.fetchMessage(account, messageId, format);
     if (message.labelIds?.includes("DRAFT")) {
-      throw new Error("This is a draft; use gmail_get_draft or gmail_list_drafts.");
+      throw new Error("This is a draft; read it by its draft ID from mail_list_drafts.");
     }
     return { account, ...messageView(account, message, format, maxBodyChars) };
   }
@@ -626,12 +703,7 @@ export class Gmail {
             error: response.body?.error?.message ?? `HTTP ${response.status}`,
           };
         }
-        const view = this.draftView(
-          account,
-          response.body,
-          full ? "PLAIN_TEXT" : "METADATA_ONLY",
-          5000
-        );
+        const view = this.draftView(account, response.body, full ? "PLAIN_TEXT" : "MINIMAL", 5000);
         if (full) delete view.attachments;
         return view;
       }),
@@ -717,15 +789,30 @@ export class Gmail {
     };
   }
 
-  async createDraft(account: string, args: ComposeFields & { replyToMessageId?: string }) {
+  async createDraft(
+    account: string,
+    args: ComposeFields & {
+      /** One of the account's send-as addresses; by default the reply's or the account's. */
+      from?: string;
+      replyToMessageId?: string;
+      replyAll?: boolean;
+      /** Quote the original below a reply; default true. */
+      quote?: boolean;
+      /** Forward this message, its attachments included, below the body. */
+      forwardOf?: string;
+    }
+  ) {
     const attachments = attachmentsFromInput(args.attachments);
     let input: ComposeInput;
     let threadId: string | undefined;
     if (args.replyToMessageId) {
-      const reply = await this.replyContext(account, args.replyToMessageId, { quote: true });
+      const reply = await this.replyContext(account, args.replyToMessageId, {
+        quote: args.quote ?? true,
+        replyAll: args.replyAll,
+      });
       threadId = reply.threadId;
       input = {
-        from: reply.from,
+        from: args.from ? await this.senderFor(account, args.from) : reply.from,
         to: args.to?.length ? args.to : reply.to,
         cc: args.cc?.length ? args.cc : reply.cc,
         bcc: args.bcc,
@@ -736,9 +823,21 @@ export class Gmail {
         inReplyTo: reply.inReplyTo,
         references: reply.references,
       };
+    } else if (args.forwardOf) {
+      const forward = await this.forwardInput(account, {
+        ...args,
+        messageId: args.forwardOf,
+        forwardText: args.body,
+      });
+      input = {
+        ...forward,
+        from: await this.senderFor(account, args.from),
+        subject: args.subject || forward.subject,
+        attachments: [...(forward.attachments ?? []), ...attachments],
+      };
     } else {
       input = {
-        from: await this.defaultSender(account),
+        from: await this.senderFor(account, args.from),
         to: args.to ?? [],
         cc: args.cc,
         bcc: args.bcc,
@@ -770,9 +869,18 @@ export class Gmail {
 
   /**
    * Merge an update into a draft. Unlike Gmail's connector, existing
-   * attachments are kept unless `attachments` is given (an empty list removes them).
+   * attachments are kept unless `attachments` replaces them (an empty list
+   * removes them all); `attachmentsToAdd` and `attachmentNamesToRemove` edit them.
    */
-  async updateDraft(account: string, draftId: string, args: ComposeFields) {
+  async updateDraft(
+    account: string,
+    draftId: string,
+    args: ComposeFields & {
+      from?: string;
+      attachmentsToAdd?: AttachmentInput[];
+      attachmentNamesToRemove?: string[];
+    }
+  ) {
     const draft = await this.get(account, `drafts/${encodeURIComponent(draftId)}`, {
       format: "raw",
     });
@@ -786,8 +894,11 @@ export class Gmail {
       html = args.htmlBody || undefined;
       text = args.body || (args.htmlBody ? htmlToText(args.htmlBody) : "");
     }
+    const removed = new Set(args.attachmentNamesToRemove ?? []);
     const raw = await composeMime({
-      from: current.from || (await this.defaultSender(account)),
+      from: args.from
+        ? await this.senderFor(account, args.from)
+        : current.from || (await this.defaultSender(account)),
       to: pick(args.to, current.to),
       cc: pick(args.cc, current.cc),
       bcc: pick(args.bcc, current.bcc),
@@ -797,11 +908,16 @@ export class Gmail {
       attachments:
         args.attachments !== undefined
           ? attachmentsFromInput(args.attachments)
-          : current.attachments.map((item) => ({
-              filename: item.filename,
-              content: item.content,
-              contentType: item.contentType,
-            })),
+          : [
+              ...current.attachments
+                .filter((item) => !removed.has(item.filename))
+                .map((item) => ({
+                  filename: item.filename,
+                  content: item.content,
+                  contentType: item.contentType,
+                })),
+              ...attachmentsFromInput(args.attachmentsToAdd),
+            ],
       inReplyTo: current.inReplyTo,
       references: current.references,
     });
@@ -924,20 +1040,16 @@ export class Gmail {
     );
   }
 
-  async forward(
-    account: string,
-    args: {
-      messageId: string;
-      to?: string[];
-      cc?: string[];
-      bcc?: string[];
-      forwardText?: string;
-      htmlBody?: string;
-    }
-  ) {
+  async forward(account: string, args: ForwardArgs) {
     if (!args.to?.length && !args.cc?.length && !args.bcc?.length) {
       throw new Error("Give at least one recipient to forward to.");
     }
+    const raw = await composeMime(await this.forwardInput(account, args));
+    return this.sent(account, await this.upload(account, "POST", "messages/send", {}, raw));
+  }
+
+  /** A forward of `messageId`, with its attachments, below the comments. */
+  private async forwardInput(account: string, args: ForwardArgs): Promise<ComposeInput> {
     const original = await this.fetchMessage(account, args.messageId, "FULL_CONTENT");
     const headers = original.payload?.headers;
     const { text, html, attachments } = collectParts(original.payload);
@@ -961,8 +1073,7 @@ export class Gmail {
       .join(
         "<br>"
       )}</div><br>${html.length ? bodyHtml(html.join("\n")) : textAsHtml(originalText)}</div>`;
-    const files = await this.originalAttachments(account, original.id, attachments);
-    const raw = await composeMime({
+    return {
       from: await this.defaultSender(account),
       to: args.to ?? [],
       cc: args.cc,
@@ -970,9 +1081,8 @@ export class Gmail {
       subject: withSubjectPrefix(header(headers, "Subject") ?? "", "Fwd:"),
       text: plain,
       html: htmlBody,
-      attachments: files,
-    });
-    return this.sent(account, await this.upload(account, "POST", "messages/send", {}, raw));
+      attachments: await this.originalAttachments(account, original.id, attachments),
+    };
   }
 
   /** The original's attachments, fetched in one batch, for forwarding. */

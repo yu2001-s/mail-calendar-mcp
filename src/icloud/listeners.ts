@@ -96,7 +96,7 @@ type Fetch = (url: string, init: RequestInit) => Promise<Response>;
 
 export interface WatcherDeps {
   storage: WatchStorage;
-  /** The IMAP account label message IDs carry, as read_message expects. */
+  /** The IMAP account label message IDs carry, as mail_read expects. */
   imapAccount: string;
   /** The iCloud primary address: the only account that can be watched. */
   primaryAddress: () => Promise<string>;
@@ -455,7 +455,7 @@ export class MailWatcher {
 }
 
 export const MAIL_LISTEN_INSTRUCTIONS =
-  "mail_listen_set registers a webhook for new iCloud mail (INBOX, optionally Junk for bounces): each new message's headers are POSTed to it, never its body, and nothing is marked read.";
+  "mail_listen_set POSTs the headers of new iCloud mail to a webhook.";
 
 /** Register mail_listen_set, mail_listen_list and mail_listen_remove. */
 export function registerMailListenTools(server: McpServer, watcher: MailWatcher): void {
@@ -464,7 +464,7 @@ export function registerMailListenTools(server: McpServer, watcher: MailWatcher)
     "mail_listen_set",
     {
       description:
-        "Registers a webhook for new iCloud mail. About once a minute, every new message in the chosen mailboxes is POSTed to url as JSON {text, listener, account, mailbox, message: {id, rfcMessageId, inReplyTo, from, to, subject, date}}; message.id works with read_message and create_reply_draft. Headers only, never the body, and nothing is marked read. Each message is sent once; a new listener starts with mail that arrives after it is set. Failed deliveries are retried with backoff. Setting an existing name replaces that listener. Only the iCloud account can be watched, not Gmail accounts.",
+        "Registers a webhook for new iCloud mail. About once a minute, every new message in the chosen mailboxes is POSTed to url as JSON {text, listener, account, mailbox, message: {id, rfcMessageId, inReplyTo, from, to, subject, date}}; message.id works with mail_read and as replyTo in mail_create_draft. Headers only, never the body, and nothing is marked read. Each message is sent once; a new listener starts with mail that arrives after it is set. Failed deliveries are retried with backoff. Setting an existing name replaces that listener. Only the iCloud account can be watched, not Gmail accounts.",
       inputSchema: {
         name: z.string().min(1).max(100).describe("Name for this listener, e.g. your agent's name"),
         url: z.string().url().describe("https webhook to POST each new message to"),

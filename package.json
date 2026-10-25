@@ -1,6 +1,6 @@
 {
   "name": "mail-calendar-mcp",
-  "version": "1.6.0",
+  "version": "2.0.0",
   "private": true,
   "packageManager": "pnpm@11.9.0",
   "description": "Mail & Calendar MCP connector on Cloudflare Workers: direct iCloud IMAP/SMTP with threaded replies and saved signatures, plus Gmail and Google Calendar for many accounts",

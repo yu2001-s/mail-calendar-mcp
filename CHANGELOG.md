@@ -1,11 +1,47 @@
 # Changelog
 
-## Unreleased
+## 2.0.0 — 2026-10-25
 
-- The server instructions and `gmail_create_draft` now say that a reviewed
-  Gmail draft is sent with `gmail_send_message` and its `draftId`. Without
-  this, a host looking for a way to send the draft found only the iCloud
-  `send_draft` and resent the text as a new message instead.
+- **One set of mail tools for every account.** The 21 iCloud tools and the 29
+  `gmail_*` tools are replaced by 13 `mail_*` tools that work the same for the
+  iCloud account and every linked Gmail account, so a host no longer chooses
+  between two interfaces, or between same-named tools of other connectors.
+  Every ID names its account (`imap:…` and `apple-draft:…` for iCloud,
+  `gmail:<kind>:<address>:<id>` for Gmail), so a message found in any account
+  is read, answered and moved there without naming the account again, and a
+  draft's `from` address picks the account it is sent from.
+  - `mail_search` covers every account at once, merged newest first, with one
+    cursor for more; folders (`inbox`, `sent`, `archive`, `junk`, `trash`,
+    `all`, or a mailbox or label name) and fields mean the same everywhere.
+  - `mail_read` reads a message, a Gmail thread or a draft, in plain text by
+    default, with attachment IDs for `mail_get_attachment`.
+  - `mail_create_draft` saves a new message, a reply (`replyTo`) or a forward
+    (`forward`), which iCloud now supports too, attachments included.
+    `mail_update_draft` edits a draft, and `mail_send` sends it as saved,
+    given its current revision; a Gmail draft's revision is its current
+    message ID. Mail is always sent from a draft: Gmail's immediate
+    `gmail_reply`, `gmail_forward` and direct `gmail_send_message` are gone.
+  - Saved signatures apply to Gmail addresses as well as iCloud ones.
+  - `mail_update` marks, flags, labels and moves any number of messages in
+    their own accounts, and returns a moved iCloud message's new ID when the
+    server reports it. `mail_list_folders` and `mail_manage_folder` cover
+    iCloud mailboxes and Gmail labels; label colours and visibility are no
+    longer set from chat.
+  - `mail_settings` replaces `list_sending_addresses`, `update_settings`,
+    `get_signature`, `set_signature` and `set_display_name`, and
+    `mail_health_check` checks every account. `preview_reply` is gone: a reply
+    draft is its own preview.
+  - `list_accounts` also lists each Gmail account's send-as addresses.
+  Clients that keep their own copy of the tools, such as ChatGPT, must refresh
+  the connector.
+- The server instructions say only what each part of the connector does and
+  fit in the 2048 characters Claude Code keeps: they had grown to about 4,000,
+  so everything after the iCloud part, including the Gmail and Calendar tools
+  and the account list, never reached the model. The Google account list now
+  comes last, and `src/mcp/server.test.ts` checks the length with five linked
+  accounts.
+- The calendar tools' `account` argument says it is required when several
+  accounts are linked, which is when leaving it out fails.
 - New-mail webhooks for iCloud: `mail_listen_set`, `mail_listen_list` and
   `mail_listen_remove`. The Durable Object polls INBOX (and Junk, if asked)
   about once a minute, read-only, and POSTs each new message's headers, never

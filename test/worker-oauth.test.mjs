@@ -207,14 +207,15 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
       await rpc(tokens.access_token, { jsonrpc: "2.0", id: 2, method: "tools/list" })
     ).json();
     const names = listed.result.tools.map((tool) => tool.name);
-    // 21 iCloud tools, 3 mail_listen_* webhooks, 29 Gmail, 8 Calendar,
+    // 13 mail_* tools for every account, 3 mail_listen_* webhooks, 8 Calendar,
     // list_accounts, set_account_nickname and create_attachment_upload.
-    assert.equal(names.length, 64, names.join(", "));
+    assert.equal(names.length, 27, names.join(", "));
     for (const name of [
       "create_attachment_upload",
-      "search_messages",
-      "gmail_search_threads",
-      "gmail_reply",
+      "mail_search",
+      "mail_create_draft",
+      "mail_send",
+      "mail_settings",
       "calendar_list_events",
       "list_accounts",
       "mail_listen_set",
@@ -223,7 +224,8 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
     ]) {
       assert(names.includes(name), `${name} is listed`);
     }
-    assert.equal(names.filter((name) => name.startsWith("gmail_")).length, 29);
+    assert.equal(names.filter((name) => name.startsWith("mail_")).length, 16);
+    assert(!names.some((name) => name.startsWith("gmail_")), "Gmail is served by mail_* tools");
     assert.equal(names.filter((name) => name.startsWith("calendar_")).length, 8);
     for (const tool of listed.result.tools) {
       assert(!JSON.stringify(tool.inputSchema).includes('"$ref"'), `${tool.name}: no $ref`);
@@ -237,19 +239,25 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
         assert.equal(result.valid, !required, `${tool.name}.${field}: null handling`);
       }
     }
-    for (const name of ["get_signature", "preview_reply", "set_signature"]) {
+    for (const [name, field] of [
+      ["mail_create_draft", "from"],
+      ["mail_update_draft", "from"],
+      ["mail_settings", "signatureFrom"],
+    ]) {
       const validate = schemas.getValidator(
-        listed.result.tools.find((tool) => tool.name === name).inputSchema.properties.from
+        listed.result.tools.find((tool) => tool.name === name).inputSchema.properties[field]
       );
       assert(validate("stranger@example.com").valid, `${name}: validate senders at runtime`);
-      assert(!validate("invalid").valid, `${name}: from must remain an email field`);
+      assert(!validate("invalid").valid, `${name}: ${field} must remain an email field`);
     }
     // Validate like a host that requires the pattern to match the complete ID.
     // A prefix-only pattern passes RegExp.test(), but fails this host check.
     for (const [name, field, sample, invalid] of [
-      ["read_message", "id", "imap:eyJhIjoiaUNsb3VkIn0", "imap:"],
-      ["preview_reply", "originalMessageId", "imap:eyJhIjoiaUNsb3VkIn0", "imap:!"],
-      ["get_draft", "draftId", "apple-draft:ea1baad1-3355-4665-a658-73e2a389cc6d", "apple-draft:"],
+      ["mail_read", "id", "imap:eyJhIjoiaUNsb3VkIn0", "imap:"],
+      ["mail_read", "id", "gmail:t:me@gmail.com:18c2a9f0b1", "gmail:t:me@gmail.com:"],
+      ["mail_get_attachment", "id", "imap:eyJhIjoiaUNsb3VkIn0#1.2", "imap:eyJhIjoiaUNsb3VkIn0"],
+      ["mail_send", "draftId", "apple-draft:ea1baad1-3355-4665-a658-73e2a389cc6d", "apple-draft:"],
+      ["mail_send", "draftId", "gmail:d:me@gmail.com:r-123", "gmail:m:me@gmail.com:18c2a"],
     ]) {
       const schema = listed.result.tools.find((tool) => tool.name === name).inputSchema;
       const pattern = new RegExp(schema.properties[field].pattern, "u");
@@ -261,7 +269,7 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
         `${name}: wrong prefix must be rejected`
       );
     }
-    const createDraft = listed.result.tools.find((tool) => tool.name === "create_draft");
+    const createDraft = listed.result.tools.find((tool) => tool.name === "mail_create_draft");
     const validateAttachments = schemas.getValidator(
       createDraft.inputSchema.properties.attachments
     );
@@ -269,25 +277,25 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
     assert(validateAttachments([{ uploadId: "up_AAAAAAAAAAAAAAAAAAAAAA" }]).valid);
     assert(!validateAttachments(["/tmp/test.txt"]).valid);
     assert(!validateAttachments([{ uploadId: "up_" }]).valid);
-    const signature = await (
+    const settings = await (
       await rpc(tokens.access_token, {
         jsonrpc: "2.0",
         id: 3,
         method: "tools/call",
-        params: { name: "get_signature", arguments: {} },
+        params: { name: "mail_settings", arguments: {} },
       })
     ).json();
-    assert.equal(JSON.parse(signature.result.content[0].text).from, sender);
+    assert.equal(JSON.parse(settings.result.content[0].text).primaryAddress, sender);
     const nulled = await (
       await rpc(tokens.access_token, {
         jsonrpc: "2.0",
         id: 4,
         method: "tools/call",
-        params: { name: "get_signature", arguments: { from: null } },
+        params: { name: "mail_settings", arguments: { signatureFrom: null, signature: null } },
       })
     ).json();
     assert.ok(!nulled.result.isError, JSON.stringify(nulled));
-    assert.equal(JSON.parse(nulled.result.content[0].text).from, sender);
+    assert.equal(JSON.parse(nulled.result.content[0].text).primaryAddress, sender);
     // Each request builds a fresh context, so this proves settings persist in KV.
     const tool = async (id, name, args) =>
       (
@@ -300,30 +308,30 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
           })
         ).json()
       ).result;
-    const updated = await tool(5, "update_settings", {
+    const updated = await tool(5, "mail_settings", {
       primaryAddress: "alias@example.com",
       addAddresses: null,
       removeAddresses: null,
     });
     assert.ok(!updated.isError, JSON.stringify(updated));
-    const signed = await tool(6, "set_signature", { from: null, signature: "Alias" });
+    const signed = await tool(6, "mail_settings", { signatureFrom: null, signature: "Alias" });
     assert.ok(!signed.isError, JSON.stringify(signed));
-    const reread = JSON.parse((await tool(7, "get_signature", {})).content[0].text);
-    assert.deepEqual(reread, { success: true, from: "alias@example.com", signature: "Alias" });
-    for (const [name, args] of [
-      ["get_signature", { from: "stranger@example.com" }],
-      ["get_signature", { from: "invalid" }],
-      ["set_signature", { from: null, signature: null }],
-      ["update_settings", { removeAddresses: ["alias@example.com"] }],
+    const reread = JSON.parse((await tool(7, "mail_settings", {})).content[0].text);
+    assert.equal(reread.primaryAddress, "alias@example.com");
+    assert.deepEqual(reread.signatures, { "alias@example.com": "Alias" });
+    for (const args of [
+      { signatureFrom: "stranger@example.com", signature: "Stranger" },
+      { signatureFrom: "invalid", signature: "Invalid" },
+      { removeAddresses: ["alias@example.com"] },
     ]) {
-      const rejected = await tool(8, name, args);
-      assert.ok(rejected.isError, `${name}: invalid arguments must be rejected`);
+      const rejected = await tool(8, "mail_settings", args);
+      assert.ok(rejected.isError, `${JSON.stringify(args)} must be rejected`);
     }
-    const unchanged = JSON.parse((await tool(9, "get_signature", { from: null })).content[0].text);
+    const unchanged = JSON.parse((await tool(9, "mail_settings", {})).content[0].text);
     assert.deepEqual(unchanged, reread, "rejected calls must not change settings");
 
     // Google tools explain how to link an account before one is linked.
-    const unlinked = await tool(10, "gmail_search_threads", { query: "is:unread", account: null });
+    const unlinked = await tool(10, "calendar_list_events", { account: null });
     assert.ok(unlinked.isError, JSON.stringify(unlinked));
     assert.match(
       unlinked.content[0].text,
@@ -356,7 +364,7 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
     });
     assert.equal((await upload(ticket.uploadUrl, "again")).status, 409);
     // An unknown upload fails before any mail server is contacted.
-    const missing = await tool(13, "create_draft", {
+    const missing = await tool(13, "mail_create_draft", {
       to: ["friend@example.com"],
       subject: "Notes",
       body: "Attached.",

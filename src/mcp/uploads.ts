@@ -83,7 +83,7 @@ export async function withUploads<T, A, R>(
 }
 
 export const UPLOAD_INSTRUCTIONS =
-  "To attach an existing file from a client that can run shell commands, call create_attachment_upload, upload the file with the returned curl command, and pass {uploadId} as the attachment. Never paste a file's base64 into a tool call when an upload is possible.";
+  "create_attachment_upload returns a one-time URL for uploading a local file, which drafts and messages then attach by uploadId instead of base64.";
 
 export function registerUploadTool(server: McpServer, uploads: Uploads): void {
   registerTool(
@@ -91,7 +91,7 @@ export function registerUploadTool(server: McpServer, uploads: Uploads): void {
     "create_attachment_upload",
     {
       description:
-        "Get a one-time URL for attaching a local file without passing its bytes through the conversation, for clients that can run shell commands (such as Claude Code). Upload the file with the returned command within 15 minutes; the response reports its size and sha256. Then pass {uploadId} as an attachment to create_draft, update_draft (attachmentsToAdd), gmail_create_draft, gmail_update_draft or gmail_send_message. Up to 25 MiB per file. An upload is deleted once attached, or after a day.",
+        "Get a one-time URL for attaching a local file without passing its bytes through the conversation, for clients that can run shell commands (such as Claude Code). Upload the file with the returned command within 15 minutes; the response reports its size and sha256. Then pass {uploadId} as an attachment to mail_create_draft or mail_update_draft (attachmentsToAdd). Up to 25 MiB per file. An upload is deleted once attached, or after a day.",
       inputSchema: {
         filename: z
           .string()

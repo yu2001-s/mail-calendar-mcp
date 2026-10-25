@@ -66,7 +66,7 @@ security add-generic-password -s <KEYCHAIN_SERVICE> -a <KEYCHAIN_ACCOUNT> -w
 `~/.codex/integrations/icloud-mail/preferences.json` (or the directory in
 `ICLOUD_MAIL_DATA_DIR`) supplies `primaryAddress` and a `signatures` object
 keyed by sender address. It only seeds the settings on first use. Once
-connected, the `health_check` tool verifies IMAP and SMTP authentication
+connected, the `mail_health_check` tool verifies IMAP and SMTP authentication
 without sending.
 
 ### Worker URL
@@ -109,10 +109,9 @@ one of two ways:
   itself.
 - **Upload**: in a client that can run shell commands, such as Claude Code,
   `create_attachment_upload` returns a one-time URL. The client uploads the
-  file to it with `curl -T` and attaches it as `{uploadId}`, to iCloud drafts
-  (`create_draft`, `update_draft`) or Gmail (`gmail_create_draft`,
-  `gmail_update_draft`, `gmail_send_message`). The file never passes through
-  the conversation. Up to 25 MiB.
+  file to it with `curl -T` and attaches it as `{uploadId}` to a draft in any
+  account (`mail_create_draft`, `mail_update_draft`). The file never passes
+  through the conversation. Up to 25 MiB.
 
 Uploads are kept in the R2 bucket named in `wrangler.jsonc`. Once a draft or
 message has one, its file is replaced by an empty marker, so its link cannot
@@ -152,7 +151,7 @@ POSTed to the listener's `url` with its `headers`:
 }
 ```
 
-`message.id` is the ID `read_message` and `create_reply_draft` take. Bodies
+`message.id` is the ID `mail_read` takes, and `mail_create_draft` as `replyTo`. Bodies
 are never sent. The last UID and UIDVALIDITY are stored per listener and
 mailbox in Durable Object storage, so each message is sent once and restarts
 never replay mail; a new or replaced listener starts after the newest message,

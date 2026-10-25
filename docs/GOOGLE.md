@@ -94,26 +94,12 @@ app → OAuth app name or client ID → **Trusted**.
 
 ## Tools
 
-Every Google tool takes `account`, the Google address or its nickname. It may be left out when
-only one Google account is linked. Searching mail, listing events and finding
-free time cover **every** linked account when `account` is left out. Results
+Gmail is served by the `mail_*` tools, which work the same for iCloud and every
+Gmail account (see the [README](../README.md#mail-tools)). Searching mail,
+listing events and finding free time cover **every** linked account unless
+told otherwise. The calendar tools take `account`, the Google address or its
+nickname; it may be left out when only one Google account is linked. Results
 always say which account they came from, and IDs only work with that account.
-
-| Gmail (matches Google's Gmail connector) | |
-| --- | --- |
-| `gmail_search_threads` | Gmail query syntax; headers, snippets, view URLs |
-| `gmail_get_thread`, `gmail_get_message` | `MINIMAL`, `METADATA_ONLY`, `FULL_CONTENT`, `PLAIN_TEXT`, `RAW` |
-| `gmail_get_attachment` | base64, up to 20 MiB (not in Google's connector) |
-| `gmail_list_drafts`, `gmail_get_draft` | |
-| `gmail_create_draft` | `replyToMessageId` threads and quotes the original |
-| `gmail_update_draft` | merge update; see below for attachments |
-| `gmail_delete_draft` | |
-| `gmail_send_message` | a draft as-is, or a new message, optionally threaded |
-| `gmail_reply`, `gmail_forward` | send immediately; forward keeps attachments |
-| `gmail_list_labels`, `gmail_create_label`, `gmail_update_label`, `gmail_delete_label` | nested labels and color presets |
-| `gmail_label_message`, `gmail_unlabel_message`, `gmail_label_thread`, `gmail_unlabel_thread`, `gmail_update_message_labels` | |
-| `gmail_trash_message` / `_thread`, `gmail_untrash_message` / `_thread` | |
-| `gmail_mark_message_spam` / `_thread_spam`, `gmail_unmark_message_spam` / `_thread_spam` | |
 
 | Calendar | |
 | --- | --- |
@@ -128,20 +114,19 @@ always say which account they came from, and IDs only work with that account.
 `list_accounts` shows the iCloud account and each Google account with its
 nickname and the services it granted; `set_account_nickname` names an account.
 
-How this differs from Google's own Gmail connector:
+For Gmail accounts, the mail tools:
 
-- `gmail_update_draft` keeps a draft's attachments when `attachments` is
-  omitted. Google's connector drops them. Pass an empty list to remove them.
-- Attachments may also be uploads from `create_attachment_upload`, attached
-  as `{uploadId}`, so local files need not pass through the conversation (see
-  [WORKER.md](WORKER.md#attachments)).
-- Replies go out from the address the original was sent to when it is one of
-  your verified Gmail "Send mail as" addresses.
-- `apply_sensitive_message_label` and `apply_sensitive_thread_label` are left
-  out. Google itself steers callers to the trash and spam tools, which are
-  included.
-- Bodies are capped at 50,000 characters by default (`maxBodyChars`), and
-  `bodyTruncated` says when a cap applied.
+- keep a draft's attachments unless `attachmentNamesToRemove` names them, and
+  add `attachmentsToAdd`;
+- take uploads from `create_attachment_upload`, attached as `{uploadId}`, so
+  local files need not pass through the conversation (see
+  [WORKER.md](WORKER.md#attachments));
+- reply from the address the original was sent to when it is one of your
+  verified Gmail "Send mail as" addresses;
+- use a draft's current message ID as its revision, so `mail_send` never
+  sends a draft that changed in Gmail after it was read;
+- cap bodies at 20,000 characters by default (`maxBodyChars`), with
+  `bodyTruncated` when a cap applied.
 
 ## Security
 
