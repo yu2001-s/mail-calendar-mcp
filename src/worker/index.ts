@@ -176,6 +176,8 @@ const appHandler = {
   },
 };
 
+const GRANT_IDLE_TTL = 90 * 24 * 60 * 60;
+
 const providers = new Map<string, OAuthProvider<Env>>();
 
 function providerFor(origin: string, extraRedirects: string[]): OAuthProvider<Env> {
@@ -197,7 +199,10 @@ function providerFor(origin: string, extraRedirects: string[]): OAuthProvider<En
       },
       clientIdMetadataDocumentEnabled: true,
       accessTokenTTL: 60 * 60,
-      refreshTokenTTL: 30 * 24 * 60 * 60,
+      // A grant lasts 90 days from its last refresh, so a connector in use never
+      // needs approving again. A fixed lifetime signed every client out on schedule.
+      refreshTokenTTL: GRANT_IDLE_TTL,
+      refreshTokenIdleTTL: GRANT_IDLE_TTL,
       clientRegistrationCallback: ({ clientMetadata }) => {
         const uris = Array.isArray(clientMetadata.redirect_uris)
           ? clientMetadata.redirect_uris

@@ -169,7 +169,8 @@ shows header names but not their values.
 
 - `@cloudflare/workers-oauth-provider` implements OAuth 2.1: PKCE, single-use
   codes, rotating refresh tokens, tokens bound to the `/mcp` resource, and only
-  hashes of tokens and secrets in KV. Access tokens last 1 hour; grants 30 days.
+  hashes of tokens and secrets in KV. Access tokens last 1 hour; a grant expires
+  after 90 days without a refresh, so a connector in use stays signed in.
 - Clients may register dynamically (Claude) or present a Client ID Metadata
   Document (ChatGPT), but codes are only ever sent to the claude.ai,
   claude.com and chatgpt.com connector callbacks or to a loopback address. Add

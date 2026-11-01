@@ -196,6 +196,23 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
     ).json();
     assert.ok(tokens.access_token && tokens.refresh_token, JSON.stringify(tokens));
 
+    // Refreshing rotates the refresh token and keeps the grant alive.
+    const refreshed = await (
+      await fetch(metadata.token_endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          client_id: client.client_id,
+          refresh_token: tokens.refresh_token,
+          resource: `${base}/mcp`,
+        }),
+      })
+    ).json();
+    assert.ok(refreshed.access_token && refreshed.refresh_token, JSON.stringify(refreshed));
+    assert.notEqual(refreshed.refresh_token, tokens.refresh_token);
+    assert.equal(refreshed.expires_in, 60 * 60);
+
     const initialized = await rpc(tokens.access_token, initialize);
     assert.equal(initialized.status, 200, await initialized.clone().text());
     const serverInfo = (await initialized.json()).result.serverInfo;
