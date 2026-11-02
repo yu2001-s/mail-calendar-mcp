@@ -8,6 +8,8 @@ export interface MailQuery {
   text?: string;
   from?: string;
   to?: string;
+  /** Mail from, to or copied to this address or name: one correspondence both ways. */
+  with?: string;
   subject?: string;
   /** YYYY-MM-DD, inclusive. */
   since?: string;
@@ -70,6 +72,10 @@ export function gmailQuery(query: MailQuery): string {
   ];
   if (query.from) parts.push(`from:${term(query.from)}`);
   if (query.to) parts.push(`to:${term(query.to)}`);
+  if (query.with) {
+    const who = term(query.with);
+    parts.push(`{from:${who} to:${who} cc:${who}}`);
+  }
   if (query.subject) parts.push(`subject:${term(query.subject)}`);
   if (query.since) parts.push(`after:${query.since.replace(/-/g, "/")}`);
   if (query.before) parts.push(`before:${query.before.replace(/-/g, "/")}`);
@@ -85,6 +91,7 @@ export function imapCriteria(query: MailQuery): Record<string, unknown> {
   if (query.text) criteria.text = query.text;
   if (query.from) criteria.from = query.from;
   if (query.to) criteria.to = query.to;
+  if (query.with) criteria.or = [{ from: query.with }, { to: query.with }, { cc: query.with }];
   if (query.subject) criteria.subject = query.subject;
   if (query.since) criteria.since = query.since;
   if (query.before) criteria.before = query.before;

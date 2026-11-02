@@ -63,6 +63,10 @@ function fakeGoogle() {
     if (method === "GET" && message) {
       return gmailMessage(message, account, message === "w1" ? 22 : 21);
     }
+    const thread = url.match(/\/threads\/([\w-]+)\?format=/)?.[1];
+    if (method === "GET" && thread) {
+      return { id: thread, messages: [gmailMessage("m1", account, 21), gmailMessage("m2", account, 23)] }; // prettier-ignore
+    }
     if (url === `${API}/labels`) {
       return {
         labels: [
@@ -166,6 +170,8 @@ function fakeIcloud() {
       return { success: true, sentMessageId: "imap:sent" };
     },
   };
+  const searches: Array<[string, unknown]> = [];
+  let open = "";
   const client = {
     async list() {
       return [
@@ -173,10 +179,12 @@ function fakeIcloud() {
         { path: "Sent Messages", name: "Sent Messages", specialUse: "\\Sent" },
       ];
     },
-    async getMailboxLock() {
+    async getMailboxLock(path: string) {
+      open = path;
       return { release() {} };
     },
-    async search() {
+    async search(criteria: unknown) {
+      searches.push([open, criteria]);
       return [7];
     },
     async *fetch() {
@@ -213,7 +221,7 @@ function fakeIcloud() {
     checkId() {},
     serialize: <T>(fn: () => Promise<T>) => fn(),
   };
-  return { icloud: ctx as unknown as ConnectorContext, recorded };
+  return { icloud: ctx as unknown as ConnectorContext, recorded, searches };
 }
 
 describe("mail tools", () => {
@@ -260,6 +268,33 @@ describe("mail tools", () => {
     expect(more.messages.map((m: any) => m.account)).toEqual([ME]);
     const next = gmail.calls.find((c) => c.url.startsWith(`${API}/messages?`))!;
     expect(new URL(next.url).searchParams.get("pageToken")).toBe("p2");
+  });
+
+  it("searches one person's mail both ways, in every folder unless given one", async () => {
+    await call("mail_search", { with: "Amy Chen" });
+    const query = gmail.calls.find((c) => c.url.startsWith(`${API}/messages?`))!;
+    expect(new URL(query.url).searchParams.get("q")).toBe(
+      '{from:"Amy Chen" to:"Amy Chen" cc:"Amy Chen"} -in:draft'
+    );
+    const both = [{ from: "Amy Chen" }, { to: "Amy Chen" }, { cc: "Amy Chen" }];
+    expect(icloud.searches).toEqual([
+      ["INBOX", { or: both }],
+      ["Sent Messages", { or: both }],
+    ]);
+
+    icloud.searches.length = 0;
+    await call("mail_search", { with: "Amy Chen", folder: "inbox", accounts: ["iCloud"] });
+    expect(icloud.searches.map(([path]) => path)).toEqual(["INBOX"]);
+  });
+
+  it("reads the whole conversation a Gmail message is in", async () => {
+    const thread = await call("mail_read", { id: `gmail:m:${ME}:m1`, thread: true });
+    expect(thread.threadId).toBe(`gmail:t:${ME}:t-m1`);
+    expect(thread.messages.map((m: any) => [m.id, m.body])).toEqual([
+      [`gmail:m:${ME}:m1`, "Can we meet Thursday?"],
+      [`gmail:m:${ME}:m2`, "Can we meet Thursday?"],
+    ]);
+    expect(gmail.calls.map((c) => c.url.replace(/\?.*/, ""))).toContain(`${API}/threads/t-m1`);
   });
 
   it("reads a Gmail message with attachment IDs for mail_get_attachment", async () => {

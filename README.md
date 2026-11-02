@@ -29,8 +29,8 @@ address picks the account it is sent from.
 
 | Tool | |
 | --- | --- |
-| `mail_search` | every account at once, or some; inbox by default, any folder or label, newest first, one cursor for more |
-| `mail_read` | a message, a Gmail thread, or a draft with its revision; attachment IDs |
+| `mail_search` | every account at once, or some; inbox by default, any folder or label, newest first, one cursor for more; `with` finds your mail with one person both ways |
+| `mail_read` | a message, a whole conversation (`thread: true`, iCloud included, sent replies too), or a draft with its revision; attachment IDs |
 | `mail_get_attachment` | base64, up to 20 MiB |
 | `mail_create_draft` | a new message, a reply (`replyTo`) or a forward (`forward`, with attachments); saved signatures added |
 | `mail_update_draft` | merge update, given the current revision |

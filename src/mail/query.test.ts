@@ -62,6 +62,12 @@ describe("gmailQuery", () => {
     );
   });
 
+  it("finds mail from, to or copied to one person", () => {
+    expect(gmailQuery({ folder: "all", with: "Amy Chen" })).toBe(
+      '{from:"Amy Chen" to:"Amy Chen" cc:"Amy Chen"}'
+    );
+  });
+
   it("maps special folders and searches other folders as labels", () => {
     expect(gmailQuery({ folder: "Spam" })).toBe("in:spam");
     expect(gmailQuery({ folder: "trash" })).toBe("in:trash");
@@ -77,6 +83,10 @@ describe("imapCriteria and imapFolderPaths", () => {
       seen: false,
       flagged: true,
       header: { "content-type": "multipart/mixed" },
+    });
+    expect(imapCriteria({ with: "amy@example.com", since: "2026-10-01" })).toEqual({
+      or: [{ from: "amy@example.com" }, { to: "amy@example.com" }, { cc: "amy@example.com" }],
+      since: "2026-10-01",
     });
   });
 

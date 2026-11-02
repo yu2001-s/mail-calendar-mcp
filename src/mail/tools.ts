@@ -29,6 +29,7 @@ import {
   type Uploads,
 } from "../mcp/uploads.js";
 import {
+  decodeImapId,
   encodeImapId,
   imapCreateMailbox,
   imapDeleteMailbox,
@@ -51,6 +52,7 @@ import { resolveSmtpConfig } from "../services/smtpMailer.js";
 import type { AttachmentInput as InlineAttachment, Draft } from "../types.js";
 import { escapeHtml } from "../utils/escapeHtml.js";
 import { htmlToText } from "../utils/htmlText.js";
+import { findConversation } from "./conversation.js";
 import { attachmentId, draftId, gmailId, messageId, parseGmailId, readableId } from "./ids.js";
 import {
   gmailQuery,
@@ -71,7 +73,7 @@ export function mailInstructions(primaryAddress?: string): string {
   const sender = primaryAddress
     ? `by default ${primaryAddress} (iCloud, whose inbox also receives custom-domain mail)`
     : "by default the account's own address";
-  return `mail_* tools work alike for the iCloud account and every linked Gmail account. Every ID names its account, so follow-up calls take no account; mail_search, mail_list_drafts and mail_list_folders cover every account unless given accounts. mail_create_draft saves a new message, a reply (replyTo) or a forward (forward); its from address picks the account, ${sender}. mail_update_draft edits a draft, and mail_send sends one with its current revision. Saved signatures are added to drafts. mail_update marks, flags, labels and moves messages.`;
+  return `mail_* tools work alike for the iCloud account and every linked Gmail account. Every ID names its account, so follow-up calls take no account; mail_search, mail_list_drafts and mail_list_folders cover every account unless given accounts. mail_create_draft saves a new message, a reply (replyTo) or a forward (forward); its from address picks the account, ${sender}. mail_update_draft edits a draft, and mail_send sends one with its current revision. Saved signatures are added to drafts. mail_update marks, flags, labels and moves messages. Before saying where a conversation stands, read it with mail_read thread: true, which includes your sent replies, and go by its last message.`;
 }
 
 export interface MailServices {
@@ -514,6 +516,27 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
     };
   }
 
+  /** The conversation an iCloud message is in, oldest first, from every folder. */
+  async function icloudConversation(id: string, format: string, maxBodyChars: number) {
+    const ctx = needIcloud();
+    checkIcloudId(id);
+    const found = await ctx.withImap((client) =>
+      findConversation(client, decodeImapId(id)!, (address) =>
+        ctx.settings.addresses.some((own) => sameAddress(own, address))
+      )
+    );
+    const messages = [];
+    for (const item of found.messages) {
+      const itemId = encodeImapId(ctx.account, item.path, item.uid);
+      messages.push(await icloudMessage(itemId, format, maxBodyChars));
+    }
+    return {
+      account: ctx.account,
+      messages,
+      ...(found.omitted && { omitted: found.omitted }),
+    };
+  }
+
   /** A forward of an iCloud message, with its attachments, below the comments. */
   async function icloudForward(sourceId: string, comment: { body?: string; htmlBody?: string }) {
     const ctx = needIcloud();
@@ -649,7 +672,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
 
   tool(
     "mail_search",
-    "Search mail in every account, or those in accounts, newest first. Returns headers, not bodies: read one with mail_read. Each account returns up to limit messages; pass nextCursor back as cursor for more.",
+    "Search mail in every account, or those in accounts, newest first. Returns headers, not bodies: read one with mail_read. text finds only the messages that contain it, so later replies in a conversation can be missing: before saying where a conversation stands, read it with mail_read thread: true. Each account returns up to limit messages; pass nextCursor back as cursor for more.",
     {
       accounts: accountsField(),
       folder: z
@@ -670,6 +693,12 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
         .describe(
           "Part of a recipient's name or address; the iCloud inbox also receives mail for custom-domain addresses."
         ),
+      with: z
+        .string()
+        .optional()
+        .describe(
+          "Part of the name or address of someone the mail is from, to or copied to: your mail with them both ways. Without folder, searches all."
+        ),
       subject: z.string().optional().describe("Part of the subject."),
       since: z.string().date().optional().describe("YYYY-MM-DD, inclusive."),
       before: z.string().date().optional().describe("YYYY-MM-DD, exclusive."),
@@ -686,7 +715,8 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
     async (args) => {
       const positions = args.cursor ? decodeCursor(args.cursor) : undefined;
       const targets = await mailAccounts(positions ? Object.keys(positions) : args.accounts);
-      const query: MailQuery = args;
+      // A correspondence is in Sent as much as in the inbox.
+      const query: MailQuery = { ...args, folder: args.folder ?? (args.with ? "all" : undefined) };
       const results = await Promise.all(
         targets.map(async (account) => {
           try {
@@ -722,9 +752,13 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
 
   tool(
     "mail_read",
-    "Read a message, a whole Gmail thread, or a draft (with its revision), with attachment IDs for mail_get_attachment. Does not mark mail read.",
+    "Read a message, a whole conversation (thread: true, or a Gmail thread ID), or a draft (with its revision), with attachment IDs for mail_get_attachment. A conversation comes oldest first from every folder, your sent replies included, so its last message is where it stands. Does not mark mail read.",
     {
       id: readableId(),
+      thread: z
+        .boolean()
+        .default(false)
+        .describe("true: the whole conversation the message is in, not just the message."),
       format: z
         .enum(["text", "html"])
         .default("text")
@@ -744,7 +778,9 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
         if (args.id.startsWith("apple-draft:")) {
           return icloudDraftResult(await needIcloud().drafts.getDraft(args.id));
         }
-        return icloudMessage(args.id, args.format, args.maxBodyChars);
+        return args.thread
+          ? icloudConversation(args.id, args.format, args.maxBodyChars)
+          : icloudMessage(args.id, args.format, args.maxBodyChars);
       }
       const { gmail } = needGmail();
       const account = (await accountOf(args.id)).name;
@@ -756,10 +792,19 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
         );
       }
       const names = await labelNames(account);
-      if (parsed.kind === "thread") {
-        const thread = await gmail.getThread(account, parsed.id, format, args.maxBodyChars);
+      let threadId = parsed.kind === "thread" ? parsed.id : undefined;
+      if (args.thread && parsed.kind === "message") {
+        const view: Record<string, unknown> = await gmail.getMessage(
+          account,
+          parsed.id,
+          "METADATA_ONLY"
+        );
+        threadId = view.threadId as string | undefined;
+      }
+      if (threadId) {
+        const thread = await gmail.getThread(account, threadId, format, args.maxBodyChars);
         return {
-          threadId: args.id,
+          threadId: gmailId("thread", account, threadId),
           account,
           messages: thread.messages.map((view) => gmailMessage(account, view, names)),
         };

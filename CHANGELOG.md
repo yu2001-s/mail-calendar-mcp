@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- **Read a whole conversation, in any account.** `mail_read` takes
+  `thread: true` with any message ID and returns the conversation the message
+  is in, oldest first, so its last message is where it stands. iCloud has no
+  thread IDs and keeps your replies in Sent, so its conversations are found
+  in every folder but Drafts, Junk and Trash: the messages the reply headers
+  (Message-ID, In-Reply-To, References) link together, and, where a client
+  dropped those headers, the messages with the same subject to or from the
+  same people (`src/mail/conversation.ts`). A keyword search had found only
+  the replies that repeated the keyword, so an agent missed a short later
+  reply that moved a meeting and answered from an outdated message.
+- `mail_search` takes `with`: mail from, to or copied to one person, in every
+  folder unless given one, so a correspondence no longer takes a search of the
+  inbox and another of Sent.
+- `mail_search`, `mail_read` and the server instructions say that a keyword
+  finds only the messages containing it, and to read the conversation before
+  saying where it stands.
+
 ## 2.0.0 — 2026-10-25
 
 - **One set of mail tools for every account.** The 21 iCloud tools and the 29
