@@ -8,6 +8,7 @@
 import { describe, it, expect } from "vitest";
 import {
   extractAddresses,
+  firstDisplayName,
   parseOriginalHeaders,
   withSubjectPrefix,
   quoteBody,
@@ -94,8 +95,37 @@ describe("quoteBody", () => {
   });
 });
 
+describe("firstDisplayName", () => {
+  it("reads a quoted, plain or encoded name, and none for a bare address", () => {
+    expect(firstDisplayName('"Huang, Shao" <s@example.com>, b@example.com')).toBe("Huang, Shao");
+    expect(firstDisplayName("Alice Example <alice@example.com>")).toBe("Alice Example");
+    expect(firstDisplayName("=?UTF-8?B?6buD57S55a6H?= <peter@example.com>")).toBe("黃紹宇");
+    expect(firstDisplayName("alice@example.com")).toBeUndefined();
+    expect(firstDisplayName("<alice@example.com>")).toBeUndefined();
+    expect(firstDisplayName("alice@example.com <alice@example.com>")).toBeUndefined();
+  });
+});
+
 describe("buildReplyOptions", () => {
   const original = parseOriginalHeaders(RAW);
+
+  it("names the sender in the attribution, as mail clients do", () => {
+    const reply = (from: string) =>
+      buildReplyOptions({
+        original: parseOriginalHeaders(RAW.replace(/^From: .*$/m, `From: ${from}`)),
+        originalPlainText: "Hi",
+        body: "Thanks!",
+        replyAll: false,
+        self: ["me@myhost.com"],
+        from: "me@myhost.com",
+      }).body;
+    expect(reply("Alice Example <alice@example.com>")).toContain(
+      "On Mon, 23 Jun 2026 10:00:00 -0400, Alice Example <alice@example.com> wrote:\n> Hi"
+    );
+    expect(reply("alice@example.com")).toContain(
+      "On Mon, 23 Jun 2026 10:00:00 -0400, alice@example.com wrote:"
+    );
+  });
 
   it("replies to the sender with Re: subject and full threading headers", () => {
     const opts = buildReplyOptions({
