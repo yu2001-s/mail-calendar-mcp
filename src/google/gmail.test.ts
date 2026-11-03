@@ -286,6 +286,7 @@ describe("Gmail", () => {
     expect(mime).toMatch(/^In-Reply-To: <orig@example.com>\r$/m);
     expect(mime).toMatch(/^References: <root@example.com> <orig@example.com>\r$/m);
     expect(mime).toContain("Thursday is good.");
+    expect(mime).toContain("Alice <alice@example.com> wrote:");
     expect(mime).toContain("> Can we meet?");
   });
 

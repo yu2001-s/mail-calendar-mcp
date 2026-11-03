@@ -165,7 +165,9 @@ export function parseDraftMime(raw: Buffer | string): ParsedDraftMime {
     cc: splitAddresses(getMimeHeader(headers, "Cc")),
     bcc: splitAddresses(getMimeHeader(headers, "Bcc")),
     subject: decodeHeaderWord(getMimeHeader(headers, "Subject") ?? ""),
-    body: extractTextBody(raw) ?? "",
+    // The server keeps CRLF line ends, and a text part ends with a line break
+    // the draft's author never wrote.
+    body: (extractTextBody(raw) ?? "").replace(/\r\n?/g, "\n").replace(/\n+$/, ""),
     htmlBody: extractHtmlBody(raw) ?? undefined,
     messageId: extractRfcMessageIdFromSource(source) || undefined,
     inReplyTo: getMimeHeader(headers, "In-Reply-To") ?? undefined,

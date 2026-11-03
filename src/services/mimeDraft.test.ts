@@ -9,6 +9,20 @@ import {
 } from "@/services/mimeDraft.js";
 
 describe("draft MIME composition", () => {
+  it("reads a body back as written, from the server's CRLF copy too", async () => {
+    const body = "Hi\n\nOn X, a wrote:\n> quoted";
+    const raw = await composeDraftMime({
+      from: "a@example.com",
+      to: ["b@example.com"],
+      subject: "Re: x",
+      body,
+      draftUuid: "u1",
+    });
+    const crlf = Buffer.from(raw.toString("utf8").replace(/\r?\n/g, "\r\n"));
+    expect(parseDraftMime(raw).body).toBe(body);
+    expect(parseDraftMime(crlf).body).toBe(body);
+  });
+
   it("reads the connector draft id back from the stored headers only", async () => {
     const raw = await composeDraftMime({
       draftUuid: "00000000-0000-4000-8000-0000000000aa",

@@ -5,6 +5,7 @@
  * addressing, subject-prefix and quoting rules are unit-testable without a
  * mail server.
  */
+import { decodeHeaderWord } from "@/services/mimeDraft.js";
 import type { SmtpSendOptions } from "@/services/smtpMailer.js";
 
 /** The subset of an original message's headers we need to reply/forward. */
@@ -15,6 +16,8 @@ export interface OriginalHeaders {
   references: string[];
   /** `From` address(es), bare (no display name). */
   from: string[];
+  /** The first sender's display name, decoded, when it has one. */
+  fromName?: string;
   /** `Reply-To` address(es), bare. Preferred over {@link from} for replies. */
   replyTo: string[];
   /** `To` address(es), bare. */
@@ -44,6 +47,14 @@ export function extractAddresses(headerValue: string): string[] {
       return (angle ? angle[1] : part).trim();
     })
     .filter((addr) => addr.includes("@"));
+}
+
+/** The decoded display name of the first mailbox in `Name <addr>, ...`, if any. */
+export function firstDisplayName(headerValue: string): string | undefined {
+  const match = /^\s*(?:"((?:[^"\\]|\\.)*)"|([^<,"]*?))\s*<([^<>\s]+)>/.exec(headerValue);
+  if (!match) return undefined;
+  const name = decodeHeaderWord((match[1] ?? match[2] ?? "").replace(/\\(.)/g, "$1")).trim();
+  return name && name.toLowerCase() !== match[3].toLowerCase() ? name : undefined;
 }
 
 /**
@@ -76,10 +87,13 @@ export function parseOriginalHeaders(raw: string): OriginalHeaders {
   const references =
     `${get("References") ?? ""} ${get("In-Reply-To") ?? ""}`.match(/<[^>]+>/g) ?? [];
 
+  const fromName = firstDisplayName(get("From") ?? "");
+
   return {
     messageId,
     references,
     from: extractAddresses(get("From") ?? ""),
+    ...(fromName && { fromName }),
     replyTo: extractAddresses(get("Reply-To") ?? ""),
     to: extractAddresses(get("To") ?? ""),
     cc: extractAddresses(get("Cc") ?? ""),
@@ -179,8 +193,16 @@ export function buildReplyOptions(args: {
   };
 }
 
-/** "On <date>, <sender> wrote:\n" — omits the date clause when unknown. */
+/**
+ * "On <date>, <Name> <sender> wrote:\n", as mail clients write it; the name
+ * when the sender has one, and no date clause when it is unknown.
+ */
 function buildAttribution(original: OriginalHeaders): string {
-  const who = original.from[0] ?? original.replyTo[0] ?? "the sender";
+  const address = original.from[0];
+  const who = address
+    ? original.fromName
+      ? `${original.fromName} <${address}>`
+      : address
+    : (original.replyTo[0] ?? "the sender");
   return original.date ? `On ${original.date}, ${who} wrote:\n` : `${who} wrote:\n`;
 }
