@@ -17,9 +17,26 @@ export interface ToolResult {
   isError: boolean;
 }
 
+/** The schema inside optional, default and nullable wrappers. */
+function unwrapped(schema: z.ZodTypeAny): z.ZodTypeAny {
+  if (schema instanceof z.ZodOptional || schema instanceof z.ZodNullable) {
+    return unwrapped(schema.unwrap());
+  }
+  return schema instanceof z.ZodDefault ? unwrapped(schema.removeDefault()) : schema;
+}
+
+/**
+ * A client that cached an older tool list sends an argument it does not know
+ * as text, so "true" and "false" are read as booleans.
+ */
+function textBoolean(value: unknown): unknown {
+  return value === "true" ? true : value === "false" ? false : value;
+}
+
 /**
  * Strict-mode clients such as ChatGPT send null for every optional argument
- * they leave unset; treat that as absent so defaults apply.
+ * they leave unset; treat that as absent so defaults apply. Booleans also
+ * accept "true" and "false".
  */
 export function nullAsAbsent(shape: z.ZodRawShape): z.ZodRawShape {
   // Keep optional/default wrappers outside nullable so the exported JSON
@@ -34,10 +51,18 @@ export function nullAsAbsent(shape: z.ZodRawShape): z.ZodRawShape {
     return schema.description ? nullable.describe(schema.description) : nullable;
   }
   return Object.fromEntries(
-    Object.entries(shape).map(([key, schema]) => [
-      key,
-      schema.isOptional() ? z.preprocess((value) => value ?? undefined, allowNull(schema)) : schema,
-    ])
+    Object.entries(shape).map(([key, schema]) => {
+      const read =
+        unwrapped(schema) instanceof z.ZodBoolean ? textBoolean : (value: unknown) => value;
+      return [
+        key,
+        schema.isOptional()
+          ? z.preprocess((value) => read(value ?? undefined), allowNull(schema))
+          : read === textBoolean
+            ? z.preprocess(textBoolean, schema)
+            : schema,
+      ];
+    })
   );
 }
 

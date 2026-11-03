@@ -36,6 +36,15 @@ describe("editedContent", () => {
     });
   });
 
+  it("gives the same body however often a saved draft is edited", () => {
+    // A saved draft reads back with a line break after its quote.
+    const saved = (body: string) => `${body}\n\r\n`;
+    const once = editedContent({ body: saved(reply) }, { body: "Edit" }).body;
+    const twice = editedContent({ body: saved(once) }, { body: "Edit" }).body;
+    expect(twice).toBe(once);
+    expect(once.endsWith("> Lunch?")).toBe(true);
+  });
+
   it("drops the quoted part when asked", () => {
     expect(editedContent({ body: reply }, { body: "Just this" }, false)).toEqual({
       body: "Just this",
