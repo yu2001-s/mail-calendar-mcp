@@ -422,6 +422,7 @@ export class ImapDraftManager {
       attachments: mimeAttachmentsForResource(parsed, draftId),
       backend: "imap",
       deliveryState: entry.state,
+      updatedAt: entry.updatedAt,
     };
   }
 

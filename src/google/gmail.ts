@@ -6,6 +6,7 @@
 import nodemailer from "nodemailer";
 import type { GoogleAccounts } from "./accounts.js";
 import { decodeHeaderWord, parseDraftMime, splitAddresses } from "../services/mimeDraft.js";
+import { editedContent, FORWARD_INTRO } from "../services/quotedContent.js";
 import {
   buildReplyOptions,
   parseOriginalHeaders,
@@ -392,6 +393,19 @@ function formatSender(sendAs: SendAs): string {
   return name ? `"${name}" <${sendAs.sendAsEmail}>` : sendAs.sendAsEmail;
 }
 
+/** The name and address of a header value such as `"Name" <a@b.c>`; no name for a bare address. */
+export function nameAndAddress(value: string): { name?: string; address: string } {
+  const match = /^\s*(?:"((?:[^"\\]|\\.)*)"|([^<]*?))\s*<([^<>\s]+)>\s*$/.exec(value);
+  if (!match) return { address: value.trim() };
+  const name = (match[1] ?? match[2] ?? "").replace(/\\(.)/g, "$1").trim();
+  return { ...(name && name !== match[3] && { name }), address: match[3] };
+}
+
+export interface GmailOptions {
+  /** A name the user saved here for one of their addresses; it wins over Gmail's. */
+  displayName?: (address: string) => string | undefined;
+}
+
 interface ReplyContext {
   threadId: string;
   from: string;
@@ -421,8 +435,12 @@ function same(a: string, b: string): boolean {
 
 export class Gmail {
   private readonly sendAsCache = new Map<string, { at: number; list: SendAs[] }>();
+  private readonly sentNameCache = new Map<string, { at: number; name?: string }>();
 
-  constructor(private readonly accounts: GoogleAccounts) {}
+  constructor(
+    private readonly accounts: GoogleAccounts,
+    private readonly options: GmailOptions = {}
+  ) {}
 
   private get(account: string, path: string, query: Record<string, unknown> = {}): Promise<any> {
     const url = new URL(`${API}/${path}`);
@@ -479,7 +497,7 @@ export class Gmail {
 
   private async defaultSender(account: string): Promise<string> {
     const list = await this.sendAs(account);
-    return formatSender(list.find((item) => item.isDefault) ?? list[0]);
+    return this.sender(account, list.find((item) => item.isDefault) ?? list[0]);
   }
 
   /** The From header for one of the account's send-as addresses, or its default. */
@@ -487,7 +505,56 @@ export class Gmail {
     if (!address) return this.defaultSender(account);
     const alias = (await this.sendAs(account)).find((item) => same(item.sendAsEmail, address));
     if (!alias) throw new Error(`${address} is not a send-as address of ${account}.`);
-    return formatSender(alias);
+    return this.sender(account, alias);
+  }
+
+  /**
+   * A send-as address with a name: the one saved here, Gmail's own, or the one
+   * the account's sent mail carries. Gmail's web client signs mail with the
+   * Google account's name even when the send-as entry has none, and mail sent
+   * without one shows recipients a bare address.
+   */
+  private async sender(account: string, alias: SendAs): Promise<string> {
+    const displayName =
+      this.options.displayName?.(alias.sendAsEmail) ||
+      alias.displayName?.trim() ||
+      (await this.sentName(account, alias.sendAsEmail));
+    return formatSender({ ...alias, displayName });
+  }
+
+  /** The name on the latest sent mail from `address` that has one, cached like send-as. */
+  private async sentName(account: string, address: string): Promise<string | undefined> {
+    const key = `${account}\n${address.toLowerCase()}`;
+    const cached = this.sentNameCache.get(key);
+    if (cached && Date.now() - cached.at < SEND_AS_TTL_MS) return cached.name;
+    let name: string | undefined;
+    try {
+      const list = await this.get(account, "messages", {
+        q: `in:sent from:${address}`,
+        maxResults: 10,
+      });
+      const ids: string[] = (list.messages ?? []).map((message: { id: string }) => message.id);
+      const responses = await this.accounts.batch(
+        account,
+        BATCH,
+        ids.map((id) => ({
+          method: "GET" as const,
+          path: `/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From`,
+        }))
+      );
+      for (const response of responses) {
+        if (response.status !== 200) continue;
+        const from = nameAndAddress(header(response.body?.payload?.headers, "From") ?? "");
+        if (from.name && same(from.address, address)) {
+          name = from.name;
+          break;
+        }
+      }
+    } catch {
+      // A sender without a name still sends.
+    }
+    this.sentNameCache.set(key, { at: Date.now(), name });
+    return name;
   }
 
   async profile(account: string): Promise<{ emailAddress: string; messagesTotal?: number }> {
@@ -769,7 +836,7 @@ export class Gmail {
     const alias = sendAs.find((item) =>
       received.some((address) => same(address, item.sendAsEmail))
     );
-    const from = alias ? formatSender(alias) : await this.defaultSender(account);
+    const from = alias ? await this.sender(account, alias) : await this.defaultSender(account);
     const quotedText = reply.body;
     const attribution = `On ${parsed.date ?? "an earlier date"}, ${header(headers, "From") ?? parsed.from[0] ?? "the sender"} wrote:`;
     const originalHtml = html.length ? bodyHtml(html.join("\n")) : textAsHtml(originalText);
@@ -879,6 +946,8 @@ export class Gmail {
       from?: string;
       attachmentsToAdd?: AttachmentInput[];
       attachmentNamesToRemove?: string[];
+      /** Keep a reply's quoted original or a forwarded message below a new body; default true. */
+      keepQuoted?: boolean;
     }
   ) {
     const draft = await this.get(account, `drafts/${encodeURIComponent(draftId)}`, {
@@ -891,14 +960,25 @@ export class Gmail {
     let html: string | undefined = current.htmlBody;
     if (args.body || args.htmlBody) {
       // If only one is given, the other follows it so the two stay in sync.
-      html = args.htmlBody || undefined;
-      text = args.body || (args.htmlBody ? htmlToText(args.htmlBody) : "");
+      const edited = editedContent(
+        current,
+        { body: args.body || undefined, htmlBody: args.htmlBody || undefined },
+        args.keepQuoted
+      );
+      text = edited.body;
+      html = edited.htmlBody ?? undefined;
     }
     const removed = new Set(args.attachmentNamesToRemove ?? []);
+    // A draft saved without a sender name gets one, as a new draft would.
+    const kept = nameAndAddress(current.from);
     const raw = await composeMime({
       from: args.from
         ? await this.senderFor(account, args.from)
-        : current.from || (await this.defaultSender(account)),
+        : !current.from
+          ? await this.defaultSender(account)
+          : kept.name
+            ? current.from
+            : await this.senderFor(account, kept.address).catch(() => current.from),
       to: pick(args.to, current.to),
       cc: pick(args.cc, current.cc),
       bcc: pick(args.bcc, current.bcc),
@@ -1061,7 +1141,7 @@ export class Gmail {
       ["Cc", header(headers, "Cc")],
     ];
     const present = fields.filter((field): field is [string, string] => Boolean(field[1]));
-    const intro = "---------- Forwarded message ---------";
+    const intro = FORWARD_INTRO;
     const originalText = text.length ? text.join("\n") : htmlToText(html.join("\n"));
     const plain =
       `${args.forwardText ?? (args.htmlBody ? htmlToText(args.htmlBody) : "")}\n\n${intro}\n${present
@@ -1129,6 +1209,30 @@ export class Gmail {
         color: label.color,
       })),
     };
+  }
+
+  /** Message and unread counts of labels, which the label list leaves out, in one batch. */
+  async labelCounts(
+    account: string,
+    labelIds: string[]
+  ): Promise<Map<string, { total: number; unread: number }>> {
+    const responses = await this.accounts.batch(
+      account,
+      BATCH,
+      labelIds.map((id) => ({
+        method: "GET" as const,
+        path: `/gmail/v1/users/me/labels/${encodeURIComponent(id)}`,
+      }))
+    );
+    const counts = new Map<string, { total: number; unread: number }>();
+    responses.forEach((response, index) => {
+      if (response.status !== 200) return;
+      counts.set(labelIds[index], {
+        total: response.body?.messagesTotal ?? 0,
+        unread: response.body?.messagesUnread ?? 0,
+      });
+    });
+    return counts;
   }
 
   private labelBody(args: {

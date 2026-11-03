@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  decodePartPreview,
   parseMimeAttachments,
   extractMimeAttachment,
   extractHtmlBody,
@@ -598,5 +599,22 @@ describe("parseMimeAttachments — recursion depth cap (#defense-in-depth)", () 
     // point is that the call completes safely.
     const result = parseMimeAttachments(deep);
     expect(Array.isArray(result)).toBe(true);
+  });
+});
+
+describe("decodePartPreview", () => {
+  it("decodes a cut-off base64 part without a broken last group", () => {
+    const full = Buffer.from("Hello there, 世界").toString("base64");
+    expect(decodePartPreview(Buffer.from(full), "base64", "utf-8")).toBe("Hello there, 世界");
+    // Cut mid-group and mid-character.
+    const cut = Buffer.from(full.slice(0, full.length - 3));
+    expect(decodePartPreview(cut, "BASE64", undefined)).toBe("Hello there, 世");
+  });
+
+  it("drops a cut-off quoted-printable escape and decodes the charset", () => {
+    expect(
+      decodePartPreview(Buffer.from("Caf=C3=A9 au lait=\r\n ok=C3"), "quoted-printable", "utf-8")
+    ).toBe("Café au lait ok");
+    expect(decodePartPreview(Buffer.from([0xa7, 0x41, 0x6e]), "8bit", "big5")).toBe("你n");
   });
 });

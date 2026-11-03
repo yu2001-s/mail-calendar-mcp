@@ -20,7 +20,7 @@ import { handleAccounts } from "./accounts.js";
 import { consentPage, messagePage, retryPage } from "./consent.js";
 import { CONNECTOR_TITLE } from "../mcp/identity.js";
 import { homePage, privacyPage } from "./pages.js";
-import { handleUpload, type R2 } from "./uploads.js";
+import { handleDownload, handleUpload, type R2 } from "./uploads.js";
 import {
   consentFormAction,
   failures,
@@ -169,6 +169,7 @@ const appHandler = {
       return handleAccounts(request, env);
     }
     if (pathname.startsWith("/uploads/")) return handleUpload(request, env);
+    if (pathname.startsWith("/downloads/")) return handleDownload(request, env);
     if (pathname === "/healthz") return Response.json({ ok: true });
     if (pathname === "/") return homePage();
     if (pathname === "/privacy") return privacyPage();

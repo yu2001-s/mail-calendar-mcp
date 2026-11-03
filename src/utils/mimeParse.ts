@@ -289,6 +289,27 @@ export function parseMimeAttachmentData(source: string): MimeAttachmentData[] {
 export type MimeSource = Buffer | string;
 
 /**
+ * Decode the first bytes of a text part, fetched partially for a preview. A
+ * base64 group, quoted-printable escape or character cut off at the end is
+ * dropped rather than decoded as garbage.
+ */
+export function decodePartPreview(
+  bytes: Buffer,
+  encoding: string | undefined,
+  charset: string | undefined
+): string {
+  const enc = (encoding ?? "").toLowerCase().trim();
+  let body = bytes.toString("latin1");
+  if (enc === "base64") {
+    const clean = body.replace(/[^A-Za-z0-9+/=]/g, "");
+    body = clean.slice(0, clean.length - (clean.length % 4));
+  } else if (enc === "quoted-printable") {
+    body = body.replace(/=[0-9A-Fa-f]?$/, "");
+  }
+  return decodeCharset(decodeBody(body, enc), charset).replace(/�+$/, "");
+}
+
+/**
  * Decode a text part in its declared charset, or UTF-8 when it names none or
  * one the runtime doesn't know. A string source was already decoded, so its
  * 7bit/8bit parts have no bytes left to reinterpret and are returned as is.

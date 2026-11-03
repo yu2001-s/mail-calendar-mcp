@@ -22,12 +22,19 @@ export interface UploadTicket {
   maxBytes: number;
 }
 
+export interface DownloadLink {
+  downloadUrl: string;
+  expiresAt: string;
+}
+
 /** Where uploaded files are kept until a draft or message attaches them. */
 export interface Uploads {
   create(filename: string): Promise<UploadTicket>;
   /** The uploaded file; throws when it was never uploaded, was attached, or expired. */
   get(uploadId: string): Promise<UploadedFile>;
   delete(uploadIds: string[]): Promise<void>;
+  /** Keep a copy of a file behind a short-lived download URL, so its bytes skip the conversation. */
+  share(file: { filename: string; content: Buffer; contentType?: string }): Promise<DownloadLink>;
 }
 
 export const UPLOAD_ID_PATTERN = /^up_[A-Za-z0-9_-]{22}$/;

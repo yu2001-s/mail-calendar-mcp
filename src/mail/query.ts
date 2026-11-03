@@ -108,6 +108,8 @@ export interface Mailbox {
   name: string;
   specialUse?: string;
   flags?: Set<string>;
+  /** STATUS counts, when the listing asked for them. */
+  status?: { messages?: number; unseen?: number };
 }
 
 const SPECIAL_USE: Partial<Record<SpecialFolder, string>> = {

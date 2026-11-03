@@ -5,12 +5,20 @@
  * a draft's from address picks the account it is sent from.
  */
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ImapFlow, MessageStructureObject } from "imapflow";
 import { detectMimeType } from "nodemailer/lib/mime-funcs/mime-types.js";
 import { z } from "zod";
 import type { GoogleAccounts } from "../google/accounts.js";
-import { Gmail, MAX_ATTACHMENT_BYTES, tidyText, type AttachmentInput } from "../google/gmail.js";
+import {
+  Gmail,
+  MAX_ATTACHMENT_BYTES,
+  nameAndAddress,
+  tidyText,
+  type AttachmentInput,
+} from "../google/gmail.js";
 import type { ConnectorContext } from "../icloud/context.js";
 import {
+  addressDisplayName,
   addressesIn,
   applyDisplayName,
   applySettingsUpdate,
@@ -47,11 +55,13 @@ import {
 } from "../services/imapClient.js";
 import type { ImapDraftResult } from "../services/imapDraftManager.js";
 import type { MimeDraftAttachment } from "../services/mimeDraft.js";
+import { editedContent, FORWARD_INTRO } from "../services/quotedContent.js";
 import { withSubjectPrefix } from "../services/replyForward.js";
 import { resolveSmtpConfig } from "../services/smtpMailer.js";
 import type { AttachmentInput as InlineAttachment, Draft } from "../types.js";
 import { escapeHtml } from "../utils/escapeHtml.js";
 import { htmlToText } from "../utils/htmlText.js";
+import { decodePartPreview } from "../utils/mimeParse.js";
 import { findConversation } from "./conversation.js";
 import { attachmentId, draftId, gmailId, messageId, parseGmailId, readableId } from "./ids.js";
 import {
@@ -92,6 +102,8 @@ interface MailRow {
   account: string;
   folder?: string;
   labels?: string[];
+  /** Gmail's inbox tab: primary, promotions, social, updates or forums. */
+  category?: string;
   date?: string;
   from: string;
   to: string[];
@@ -109,6 +121,52 @@ function addresses(list?: Array<{ name?: string; address?: string }>): string[] 
   return (list ?? [])
     .filter((item) => item.address)
     .map((item) => (item.name ? `${item.name} <${item.address}>` : item.address!));
+}
+
+/** A header address as every account shows it: `Name <address>`, or the bare address. */
+export function displayAddress(value: string): string {
+  const { name, address } = nameAndAddress(value);
+  return name ? `${name} <${address}>` : address;
+}
+
+function displayAddresses(list: string[] | undefined): string[] {
+  return (list ?? []).map(displayAddress);
+}
+
+/** Gmail's inbox tab for a message, by the name Gmail shows. */
+function gmailCategory(labels: string[]): string | undefined {
+  const id = labels.find((label) => label.startsWith("CATEGORY_"));
+  if (!id) return undefined;
+  const name = id.slice("CATEGORY_".length).toLowerCase();
+  return name === "personal" ? "primary" : name;
+}
+
+/** The start of a body, on one line, as a list shows it. */
+function snippetOf(text: string, max = 200): string {
+  const line = text.replace(/\s+/g, " ").trim();
+  return line.length > max ? `${line.slice(0, max)}…` : line;
+}
+
+interface TextPart {
+  part: string;
+  type: string;
+  encoding?: string;
+  parameters?: Record<string, string>;
+}
+
+/** The part a message's snippet comes from: its first text/plain, else text/html, not attached. */
+export function previewPart(structure: MessageStructureObject | undefined): TextPart | undefined {
+  const leaves = (node: MessageStructureObject | undefined): TextPart[] =>
+    !node
+      ? []
+      : node.childNodes?.length
+        ? node.childNodes.flatMap(leaves)
+        : /^text\/(plain|html)$/i.test(node.type ?? "") && node.disposition !== "attachment"
+          ? // A single-part message's body is part 1.
+            [{ ...node, part: node.part ?? "1" }]
+          : [];
+  const parts = leaves(structure);
+  return parts.find((part) => part.type.toLowerCase() === "text/plain") ?? parts[0];
 }
 
 function bounded(text: string, max: number): { body: string; bodyTruncated?: true } {
@@ -139,7 +197,12 @@ function decodeCursor(cursor: string): Record<string, string | number> {
 
 export function registerMailTools(server: McpServer, services: MailServices): void {
   const { icloud, google, uploads } = services;
-  const gmail = google ? (services.gmail ?? new Gmail(google)) : undefined;
+  const gmail = google
+    ? (services.gmail ??
+      new Gmail(google, {
+        displayName: (address) => icloud && addressDisplayName(icloud.settings, address),
+      }))
+    : undefined;
   const icloudAccount: Account | undefined = icloud && { kind: "icloud", name: icloud.account };
 
   function tool(
@@ -311,15 +374,17 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
 
   function gmailRow(account: string, view: any, names: Map<string, string>): MailRow {
     const labels: string[] = view.labelIds ?? [];
-    const cc: string[] = view.ccRecipients ?? [];
+    const cc = displayAddresses(view.ccRecipients);
+    const category = gmailCategory(labels);
     return {
       id: gmailId("message", account, view.id),
       threadId: gmailId("thread", account, view.threadId),
       account,
       labels: shownLabels(labels, names),
+      ...(category && { category }),
       date: view.date,
-      from: view.sender ?? "",
-      to: view.toRecipients ?? [],
+      from: view.sender ? displayAddress(view.sender) : "",
+      to: displayAddresses(view.toRecipients),
       ...(cc.length && { cc }),
       subject: view.subject ?? "",
       snippet: view.snippet,
@@ -331,7 +396,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
   function gmailMessage(account: string, view: any, names: Map<string, string>) {
     const row: Partial<MailRow> = gmailRow(account, view, names);
     delete row.snippet;
-    const bcc: string[] = view.bccRecipients ?? [];
+    const bcc = displayAddresses(view.bccRecipients);
     return {
       ...row,
       ...(bcc.length && { bcc }),
@@ -351,19 +416,22 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
   }
 
   function gmailDraft(account: string, view: any) {
-    const cc: string[] = view.ccRecipients ?? [];
-    const bcc: string[] = view.bccRecipients ?? [];
+    const cc = displayAddresses(view.ccRecipients);
+    const bcc = displayAddresses(view.bccRecipients);
+    const listed = view.plaintextBody === undefined;
     return {
       draftId: gmailId("draft", account, view.id),
       revision: view.messageId,
       account,
       viewUrl: view.viewUrl,
-      from: view.sender ?? "",
-      to: view.toRecipients ?? [],
+      ...(view.date && { date: view.date }),
+      from: view.sender ? displayAddress(view.sender) : "",
+      to: displayAddresses(view.toRecipients),
       ...(cc.length && { cc }),
       ...(bcc.length && { bcc }),
       subject: view.subject ?? "",
-      ...(view.plaintextBody !== undefined && { body: view.plaintextBody }),
+      ...(listed && view.snippet && { snippet: view.snippet }),
+      ...(!listed && { body: view.plaintextBody }),
       ...(view.attachments?.length && {
         attachments: view.attachments.map((item: any) => item.filename),
       }),
@@ -375,11 +443,13 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
       draftId: draft.draftId,
       revision: draft.revision,
       account: needIcloud().account,
-      from: draft.from,
-      to: draft.to,
-      ...(draft.cc.length && { cc: draft.cc }),
-      ...(draft.bcc.length && { bcc: draft.bcc }),
+      ...(draft.updatedAt && { date: draft.updatedAt }),
+      from: displayAddress(draft.from),
+      to: displayAddresses(draft.to),
+      ...(draft.cc.length && { cc: displayAddresses(draft.cc) }),
+      ...(draft.bcc.length && { bcc: displayAddresses(draft.bcc) }),
       subject: draft.subject,
+      ...(!full && draft.body.trim() && { snippet: snippetOf(draft.body) }),
       ...(full && { body: draft.body }),
       ...(full && draft.htmlBody && { htmlBody: draft.htmlBody }),
       ...(draft.attachments?.length && {
@@ -425,14 +495,15 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
           // UIDs grow with arrival, so the newest are last.
           const recent = uids.slice(-(offset + limit));
           if (!recent.length) continue;
+          const fetched = new Map<number, { row: MailRow; text?: TextPart }>();
           for await (const message of client.fetch(
             recent.join(","),
-            { envelope: true, flags: true },
+            { envelope: true, flags: true, bodyStructure: true },
             { uid: true }
           )) {
             const envelope = message.envelope ?? {};
             const cc = addresses(envelope.cc);
-            rows.push({
+            const row: MailRow = {
               id: encodeImapId(ctx.account, path, message.uid),
               account: ctx.account,
               folder: path,
@@ -443,8 +514,11 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
               subject: envelope.subject || "(no subject)",
               unread: !message.flags?.has("\\Seen"),
               flagged: message.flags?.has("\\Flagged") ?? false,
-            });
+            };
+            rows.push(row);
+            fetched.set(message.uid, { row, text: previewPart(message.bodyStructure) });
           }
+          await addSnippets(client, fetched).catch(() => undefined);
         } finally {
           lock.release();
         }
@@ -455,6 +529,43 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
         next: offset + limit < total ? offset + limit : undefined,
       };
     });
+  }
+
+  /**
+   * Give search rows a snippet, as Gmail's have, from the first bytes of each
+   * message's text part: one partial fetch per part number, peeking so
+   * nothing is marked read.
+   */
+  async function addSnippets(
+    client: ImapFlow,
+    found: Map<number, { row: MailRow; text?: TextPart }>
+  ): Promise<void> {
+    const byPart = new Map<string, number[]>();
+    for (const [uid, { text }] of found) {
+      if (text) byPart.set(text.part, [...(byPart.get(text.part) ?? []), uid]);
+    }
+    for (const [key, uids] of byPart) {
+      for await (const message of client.fetch(
+        uids.join(","),
+        { bodyParts: [{ key, start: 0, maxLength: 4096 }] },
+        { uid: true }
+      )) {
+        const entry = found.get(message.uid);
+        const bytes: Buffer | undefined = message.bodyParts?.values().next().value;
+        if (!entry?.text || !bytes) continue;
+        const raw = decodePartPreview(bytes, entry.text.encoding, entry.text.parameters?.charset);
+        // A cut-off HTML preview can end inside a style block or a tag.
+        const text = /html/i.test(entry.text.type)
+          ? htmlToText(
+              raw
+                .replace(/<(style|script|head|title)\b(?![\s\S]*<\/\1)[\s\S]*$/i, "")
+                .replace(/<[^>]*$/, "")
+            )
+          : raw;
+        const snippet = snippetOf(tidyText(text));
+        if (snippet) entry.row.snippet = snippet;
+      }
+    }
   }
 
   async function searchGmail(account: string, query: MailQuery, limit: number, page?: string) {
@@ -497,11 +608,11 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
       account: ctx.account,
       folder: message.mailbox,
       date: message.date,
-      from: message.from[0] ?? "",
-      ...(replyTo.length && { replyTo }),
-      to: message.to,
-      ...(message.cc.length && { cc: message.cc }),
-      ...(message.bcc.length && { bcc: message.bcc }),
+      from: message.from[0] ? displayAddress(message.from[0]) : "",
+      ...(replyTo.length && { replyTo: displayAddresses(replyTo) }),
+      to: displayAddresses(message.to),
+      ...(message.cc.length && { cc: displayAddresses(message.cc) }),
+      ...(message.bcc.length && { bcc: displayAddresses(message.bcc) }),
       subject: message.subject,
       unread: !message.flags?.isRead,
       flagged: message.flags?.isFlagged ?? false,
@@ -553,7 +664,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
         ["Cc", original.cc.join(", ")],
       ] as Array<[string, string | undefined]>
     ).filter((field): field is [string, string] => Boolean(field[1]));
-    const intro = "---------- Forwarded message ---------";
+    const intro = FORWARD_INTRO;
     const originalText = original.textBody || htmlToText(original.htmlBody ?? "");
     const body =
       `${comment.body ?? (comment.htmlBody ? htmlToText(comment.htmlBody) : "")}\n\n${intro}\n${fields
@@ -819,10 +930,38 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
 
   tool(
     "mail_get_attachment",
-    "Download one attachment, by an ID from mail_read, as base64 (up to 20 MiB).",
-    { id: attachmentId() },
+    uploads
+      ? "Download one attachment, by an ID from mail_read, as base64 (up to 20 MiB), or with link: true as a URL to fetch it from within 15 minutes, which keeps its bytes out of the conversation."
+      : "Download one attachment, by an ID from mail_read, as base64 (up to 20 MiB).",
+    {
+      id: attachmentId(),
+      ...(uploads && {
+        link: z
+          .boolean()
+          .default(false)
+          .describe(
+            "true: return a download URL instead of base64, for clients that can run shell commands (curl -o <file> '<url>')."
+          ),
+      }),
+    },
     "read",
     async (args) => {
+      // Only offered when uploads are set up.
+      const asLink = async (file: {
+        size?: number;
+        filename: string;
+        mimeType?: string;
+        contentBase64: string;
+      }) => ({
+        id: args.id,
+        size: file.size,
+        ...(file.mimeType && { mimeType: file.mimeType }),
+        ...(await uploads!.share({
+          filename: file.filename,
+          content: Buffer.from(file.contentBase64, "base64"),
+          contentType: file.mimeType,
+        })),
+      });
       const parsed = parseGmailId(args.id);
       if (parsed) {
         const account = (await accountOf(args.id)).name;
@@ -832,6 +971,10 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
           parsed.id.slice(0, split),
           parsed.id.slice(split + 1)
         );
+        if ((args as { link?: boolean }).link) {
+          // Gmail's attachment ID carries no file name; curl -o names the file.
+          return asLink({ ...result, filename: "attachment" });
+        }
         return { id: args.id, size: result.size, contentBase64: result.contentBase64 };
       }
       const at = args.id.lastIndexOf("#");
@@ -844,6 +987,14 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
       );
       if (!result.success) throw new Error(result.error ?? "Attachment not found.");
       if ((result.bytes ?? 0) > MAX_ATTACHMENT_BYTES) throw new Error("Attachment exceeds 20 MiB.");
+      if ((args as { link?: boolean }).link) {
+        return asLink({
+          size: result.bytes,
+          filename: result.filename || "attachment",
+          mimeType: result.mimeType,
+          contentBase64: result.base64 ?? "",
+        });
+      }
       return {
         id: args.id,
         size: result.bytes,
@@ -855,7 +1006,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
 
   tool(
     "mail_list_folders",
-    "List the folders (iCloud mailboxes and Gmail labels) of every account, or those in accounts, with the special folder each one is.",
+    "List the folders (iCloud mailboxes and Gmail labels) of every account, or those in accounts, with the special folder each one is and how many messages it holds (total) and how many are unread.",
     { accounts: accountsField() },
     "read",
     async (args) => {
@@ -864,19 +1015,40 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
       for (const account of await mailAccounts(args.accounts)) {
         try {
           if (account.kind === "icloud") {
-            for (const box of await icloudMailboxes()) {
+            const boxes = await needIcloud().withImap(
+              async (client) =>
+                (await client.list({
+                  statusQuery: { messages: true, unseen: true },
+                })) as Mailbox[]
+            );
+            for (const box of boxes) {
               const special = mailboxSpecial(box);
-              folders.push({ account: account.name, name: box.path, ...(special && { special }) });
+              folders.push({
+                account: account.name,
+                name: box.path,
+                ...(special && { special }),
+                ...(box.status && { total: box.status.messages, unread: box.status.unseen }),
+              });
             }
           } else {
-            const { labels } = await needGmail().gmail.listLabels(account.name);
+            const { gmail } = needGmail();
+            const labels = (await gmail.listLabels(account.name)).labels.filter(
+              (label: { id: string }) =>
+                !/^(CATEGORY_|CHAT$|UNREAD$|STARRED$|IMPORTANT$)/.test(label.id)
+            );
+            const counts = await gmail
+              .labelCounts(
+                account.name,
+                labels.map((label: { id: string }) => label.id)
+              )
+              .catch(() => new Map<string, { total: number; unread: number }>());
             for (const label of labels) {
-              if (/^(CATEGORY_|CHAT$|UNREAD$|STARRED$|IMPORTANT$)/.test(label.id)) continue;
               const special = specialFolder(label.id === "SPAM" ? "junk" : label.id);
               folders.push({
                 account: account.name,
                 name: label.name,
                 ...(label.type === "system" && special && { special }),
+                ...counts.get(label.id),
               });
             }
           }
@@ -1064,7 +1236,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
 
   tool(
     "mail_update_draft",
-    "Change a draft saved by mail_create_draft: given fields replace its own, the rest stay. Needs the draft's current revision, and returns the new one.",
+    "Change a draft saved by mail_create_draft: given fields replace its own, the rest stay. A new body replaces the text above a reply's quoted original or a forwarded message, which stay. Needs the draft's current revision, and returns the new one.",
     {
       draftId: draftId(),
       revision: z.string().min(1).describe("The draft's current revision."),
@@ -1073,6 +1245,12 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
       attachmentsToAdd: attachments(),
       attachmentNamesToRemove: z.array(z.string()).max(20).optional(),
       includeSignature: includeSignature(),
+      quoteOriginal: z
+        .boolean()
+        .optional()
+        .describe(
+          "Keep the quoted original or forwarded message below a new body; default true. false drops it."
+        ),
     },
     "write",
     async (args) => {
@@ -1107,6 +1285,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
             htmlBody: content.htmlBody ?? undefined,
             attachmentsToAdd: files,
             attachmentNamesToRemove: args.attachmentNamesToRemove,
+            keepQuoted: args.quoteOriginal,
           });
           return gmailDraftById(account.name, draft);
         });
@@ -1118,15 +1297,23 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
       }
       const ctx = needIcloud();
       const from = args.from ? icloudSender(args.from) : undefined;
-      let signer = from ?? ctx.settings.primaryAddress;
-      if (!from && hasBody && args.includeSignature !== false) {
+      let content: { body?: string; htmlBody?: string | null } = {};
+      if (hasBody) {
         const current = await ctx.drafts.getDraft(args.draftId);
         if (!current.success || !current.draft) return icloudDraftResult(current);
-        signer = addressesIn(current.draft.from)[0] ?? current.draft.from;
+        const signer = from ?? addressesIn(current.draft.from)[0] ?? current.draft.from;
+        const next = signed(
+          { body: args.body, htmlBody: args.htmlBody },
+          signer,
+          args.includeSignature
+        );
+        // Body and HTML stay in step, and the quoted original stays below.
+        content = editedContent(
+          current.draft,
+          { body: next.body, htmlBody: next.htmlBody || undefined },
+          args.quoteOriginal
+        );
       }
-      const content: { body?: string; htmlBody?: string | null } = hasBody
-        ? signed({ body: args.body, htmlBody: args.htmlBody }, signer, args.includeSignature)
-        : {};
       return icloudFiles(args.attachmentsToAdd, async (files) =>
         icloudDraftResult(
           await ctx.drafts.updateDraft(args.draftId, {
@@ -1147,23 +1334,40 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
 
   tool(
     "mail_list_drafts",
-    "List drafts in every account, or those in accounts: Gmail drafts and the iCloud drafts saved here. iCloud drafts saved by other mail apps are in mail_search with folder drafts.",
+    "List drafts in every account, or those in accounts, newest first with a snippet: Gmail drafts and the iCloud drafts saved here. iCloud drafts saved by other mail apps are in mail_search with folder drafts.",
     {
       accounts: accountsField(),
-      limit: z.number().int().min(1).max(50).default(20).describe("Drafts per Gmail account."),
+      text: z
+        .string()
+        .optional()
+        .describe("Only drafts with these words in the subject, recipients or body."),
+      limit: z.number().int().min(1).max(50).default(20).describe("Drafts per account."),
     },
     "read",
     async (args) => {
       const drafts: unknown[] = [];
       const errors: unknown[] = [];
+      const words: string[] = args.text?.toLowerCase().split(/\s+/).filter(Boolean) ?? [];
       for (const account of await mailAccounts(args.accounts)) {
         try {
           if (account.kind === "icloud") {
             const list = await needIcloud().drafts.listDrafts();
             if (!list.success) throw new Error(list.error ?? "Could not list drafts.");
-            drafts.push(...(list.drafts ?? []).map((draft) => icloudDraft(draft, false)));
+            const found = (list.drafts ?? [])
+              .filter((draft) => {
+                const haystack = [draft.subject, ...draft.to, ...draft.cc, ...draft.bcc, draft.body]
+                  .join("\n")
+                  .toLowerCase();
+                return words.every((word) => haystack.includes(word));
+              })
+              .sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""))
+              .slice(0, args.limit);
+            drafts.push(...found.map((draft) => icloudDraft(draft, false)));
           } else {
-            const list = await needGmail().gmail.listDrafts(account.name, { pageSize: args.limit });
+            const list = await needGmail().gmail.listDrafts(account.name, {
+              pageSize: args.limit,
+              ...(args.text && { query: args.text }),
+            });
             drafts.push(
               ...list.drafts.map((view: any) =>
                 view.error
@@ -1370,7 +1574,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
   if (icloud) {
     tool(
       "mail_settings",
-      "Show the sending settings: the primary address new drafts send from, the iCloud sending addresses, display names and saved signatures. Give fields to change them. Gmail send-as addresses are managed in Gmail, but can have saved signatures here.",
+      "Show the sending settings: the primary address new drafts send from, the iCloud sending addresses, display names and saved signatures. Give fields to change them. Gmail send-as addresses are managed in Gmail, but can have saved signatures and display names here; without one, Gmail mail goes out under the name Gmail or its sent mail shows.",
       {
         primaryAddress: z
           .string()
@@ -1394,7 +1598,9 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
           .string()
           .email()
           .optional()
-          .describe("iCloud address the name is for; default every iCloud address."),
+          .describe(
+            "Sending address the name is for, iCloud or Gmail; default every iCloud address."
+          ),
         refresh: z
           .boolean()
           .optional()
@@ -1412,8 +1618,10 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
           await ctx.saveSettings(applySignature(ctx.settings, from, args.signature, others));
         }
         if (args.displayName !== undefined) {
-          const from = args.displayNameFrom ? icloudSender(args.displayNameFrom) : undefined;
-          await ctx.saveSettings(applyDisplayName(ctx.settings, args.displayName, from));
+          const from = args.displayNameFrom;
+          const others =
+            !from || (await sendsAs(icloudAccount!, from)) ? [] : await gmailAddresses();
+          await ctx.saveSettings(applyDisplayName(ctx.settings, args.displayName, from, others));
         }
         let discovery: { newlyAdded: string[]; suggested: string[] } | undefined;
         let discoveryError: string | undefined;
@@ -1442,6 +1650,9 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
           }
         }
         const settings = ctx.settings;
+        const gmailNames = Object.entries(settings.displayNames ?? {}).filter(
+          ([address]) => !settings.addresses.some((item) => sameAddress(item, address))
+        );
         return {
           primaryAddress: settings.primaryAddress,
           icloudAddresses: settings.addresses.map((address) => ({
@@ -1450,6 +1661,9 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
               displayName: displayNameFor(settings, address),
             }),
           })),
+          ...(gmailNames.length && {
+            gmailDisplayNames: Object.fromEntries(gmailNames),
+          }),
           signatures: settings.signatures,
           ...(settings.excluded.length && { removedByUser: settings.excluded }),
           ...discovery,

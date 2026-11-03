@@ -8,6 +8,7 @@ import type { ConnectorContext } from "../icloud/context.js";
 import type { GoogleAccounts, GoogleAccountSummary } from "../google/accounts.js";
 import { Gmail } from "../google/gmail.js";
 import { googleInstructions, registerGoogleTools } from "../google/tools.js";
+import { addressDisplayName } from "../icloud/settings.js";
 import { mailInstructions, registerMailTools } from "../mail/tools.js";
 import { CONNECTOR_DESCRIPTION, CONNECTOR_NAME, CONNECTOR_TITLE } from "./identity.js";
 import { registerTool, toolResult } from "./tooling.js";
@@ -52,7 +53,12 @@ export async function createConnectorServer(
   options: { uploads?: Uploads; websiteUrl?: string; mailListeners?: MailWatcher } = {}
 ): Promise<McpServer> {
   const { icloud, google } = services;
-  const gmail = google && new Gmail(google);
+  // A display name saved here for a Gmail address goes on its mail too.
+  const gmail =
+    google &&
+    new Gmail(google, {
+      displayName: (address) => icloud && addressDisplayName(icloud.settings, address),
+    });
   const mailListeners = icloud ? options.mailListeners : undefined;
   const uploads = icloud || google ? options.uploads : undefined;
   const instructions = connectorInstructions({

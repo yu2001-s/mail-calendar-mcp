@@ -100,6 +100,8 @@ export interface Draft {
   backend?: "imap" | "applescript";
   /** Delivery state used to prevent automatic duplicate SMTP sends. */
   deliveryState?: "draft" | "sending" | "sent" | "needs_review";
+  /** When this connector last saved the draft, as an ISO timestamp. */
+  updatedAt?: string;
 }
 
 /**
