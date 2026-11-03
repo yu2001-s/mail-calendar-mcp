@@ -39,8 +39,9 @@ export function editedContent(
   next: { body?: string; htmlBody?: string },
   keepQuoted = true
 ): { body: string; htmlBody: string | null } {
-  const textTail = keepQuoted ? quotedText(current.body) : "";
-  const htmlTail = keepQuoted ? quotedHtml(current.htmlBody) : "";
+  // Trimmed, so the line break a saved draft ends with does not pile up edit after edit.
+  const textTail = keepQuoted ? quotedText(current.body).trimEnd() : "";
+  const htmlTail = keepQuoted ? quotedHtml(current.htmlBody).trimEnd() : "";
   const text = next.body ?? (next.htmlBody ? htmlToText(next.htmlBody) : "");
   const body = textTail ? `${text.trimEnd()}\n\n${textTail}` : text;
   const html = next.htmlBody ?? (htmlTail ? escapeHtml(text).replace(/\n/g, "<br>") : undefined);

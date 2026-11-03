@@ -727,6 +727,33 @@ export class Gmail {
     };
   }
 
+  /**
+   * The file name and type of a message's attachment. Gmail may give an
+   * attachment a new ID each time the message is read, so when the ID no
+   * longer matches, the parts of the same size stand in: their name when
+   * they share one (a calendar invite comes as two invite.ics parts), and
+   * their type when there is only one.
+   */
+  async attachmentInfo(
+    account: string,
+    messageId: string,
+    attachmentId: string,
+    size: number
+  ): Promise<{ filename?: string; mimeType?: string }> {
+    const message = await this.get(account, `messages/${encodeURIComponent(messageId)}`, {
+      format: "full",
+    });
+    const parts = collectParts(message.payload).attachments;
+    const byId = parts.find((part) => part.attachmentId === attachmentId);
+    const candidates = byId ? [byId] : parts.filter((part) => part.size === size);
+    const names = new Set(candidates.map((part) => part.filename));
+    const [name] = names;
+    return {
+      ...(names.size === 1 && name !== "(unnamed)" && { filename: name }),
+      ...(candidates.length === 1 && { mimeType: candidates[0].mimeType }),
+    };
+  }
+
   private draftView(
     account: string,
     draft: { id: string; message: GmailMessage },

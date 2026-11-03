@@ -408,6 +408,74 @@ describe("Gmail", () => {
     expect(replaced).not.toContain("Forwarded message");
   });
 
+  it("keeps a reply's quoted original, text and HTML, when its body is edited", async () => {
+    const reply = await composeMime({
+      from: "me@gmail.com",
+      to: ["alice@example.com"],
+      subject: "Re: Plans",
+      text: "Old reply\n\nOn Wed, Alice <alice@example.com> wrote:\n> Can we meet?",
+      html: '<p>Old reply</p><div class="gmail_quote">On Wed, Alice wrote:<blockquote>Can we meet?</blockquote></div>',
+      inReplyTo: "<orig@example.com>",
+    });
+    const { gmail, calls } = fake(
+      router((method, url) => {
+        if (method === "GET" && url.includes("/drafts/d2")) {
+          return {
+            id: "d2",
+            message: { id: "dm", threadId: "t1", raw: reply.toString("base64url") },
+          };
+        }
+      })
+    );
+    await gmail.updateDraft(ME, "d2", { body: "New reply" });
+    const { mime } = uploadedMime(calls.at(-1)!);
+    expect(mime).not.toContain("Old reply");
+    expect(mime.match(/New reply/g)).toHaveLength(2);
+    expect(mime).toContain("gmail_quote");
+    expect(mime).toContain("> Can we meet?");
+    expect(mime).toMatch(/^In-Reply-To: <orig@example.com>\r$/m);
+  });
+
+  it("names an attachment from its part, or the one part of its size", async () => {
+    const { gmail } = fake(router());
+    // original's agenda.pdf part has attachmentId att-1.
+    expect(await gmail.attachmentInfo(ME, "m1", "att-1", 0)).toMatchObject({
+      filename: "agenda.pdf",
+    });
+    const part = collectParts(original.payload).attachments[0];
+    expect(await gmail.attachmentInfo(ME, "m1", "renamed-id", part.size)).toMatchObject({
+      filename: "agenda.pdf",
+    });
+    expect(await gmail.attachmentInfo(ME, "m1", "renamed-id", part.size + 1)).toEqual({});
+
+    // A calendar invite: two parts of one size and name, but different types.
+    const invite = (mimeType: string, attachmentId: string) => ({
+      mimeType,
+      filename: "invite.ics",
+      body: { attachmentId, size: 1131 },
+    });
+    const { gmail: inviteGmail } = fake(
+      router((_m, url) =>
+        url.includes("/messages/m5")
+          ? {
+              id: "m5",
+              payload: {
+                mimeType: "multipart/mixed",
+                parts: [invite("text/calendar", "a1"), invite("application/ics", "a2")],
+              },
+            }
+          : undefined
+      )
+    );
+    expect(await inviteGmail.attachmentInfo(ME, "m5", "renamed-id", 1131)).toEqual({
+      filename: "invite.ics",
+    });
+    expect(await inviteGmail.attachmentInfo(ME, "m5", "a2", 1131)).toEqual({
+      filename: "invite.ics",
+      mimeType: "application/ics",
+    });
+  });
+
   it("counts each label's messages in one batch", async () => {
     const { gmail, calls } = fake(
       router((_m, url) =>

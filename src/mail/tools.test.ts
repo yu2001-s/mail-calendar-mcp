@@ -1,10 +1,11 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GoogleAccounts } from "@/google/accounts.js";
 import type { ConnectorContext } from "@/icloud/context.js";
 import { registerMailTools } from "@/mail/tools.js";
+import type { Uploads } from "@/mcp/uploads.js";
 import { encodeImapId } from "@/services/imapClient.js";
 
 const API = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -107,6 +108,7 @@ function fakeGoogle() {
         },
       };
     }
+    if (url.includes("/attachments/")) return { data: b64("%PDF-1.7") };
     if (url === `${API}/drafts/send`) return { id: "s1", threadId: "t-m1", labelIds: ["SENT"] };
     if (url.endsWith("/modify")) return { id: "m1", threadId: "t-m1", labelIds: [] };
     if (url.endsWith("/trash")) return { id: "m1", threadId: "t-m1", labelIds: ["TRASH"] };
@@ -192,6 +194,7 @@ function fakeIcloud() {
     },
   };
   const searches: Array<[string, unknown]> = [];
+  const previews: string[] = [];
   let open = "";
   const client = {
     async list(options?: { statusQuery?: object }) {
@@ -212,6 +215,7 @@ function fakeIcloud() {
     },
     async *fetch(_range: string, query: { bodyParts?: Array<{ key: string }> }) {
       if (query.bodyParts) {
+        previews.push(open);
         // The first bytes of the text part, cut mid-escape.
         const text = "Hi Peter,\r\nYour invoice for Octo=\r\nber is attached. Caf=C3=A9 =C3";
         yield { uid: 7, bodyParts: new Map([[query.bodyParts[0].key, Buffer.from(text)]]) };
@@ -262,19 +266,29 @@ function fakeIcloud() {
     checkId() {},
     serialize: <T>(fn: () => Promise<T>) => fn(),
   };
-  return { icloud: ctx as unknown as ConnectorContext, recorded, searches };
+  return { icloud: ctx as unknown as ConnectorContext, recorded, searches, previews };
 }
 
 describe("mail tools", () => {
   let gmail: ReturnType<typeof fakeGoogle>;
   let icloud: ReturnType<typeof fakeIcloud>;
+  let uploads: Uploads & { share: ReturnType<typeof vi.fn> };
   let call: (name: string, args?: Record<string, unknown>) => Promise<any>;
 
   beforeEach(async () => {
     gmail = fakeGoogle();
     icloud = fakeIcloud();
+    uploads = {
+      create: vi.fn(),
+      get: vi.fn(),
+      delete: vi.fn(),
+      share: vi.fn(async () => ({
+        downloadUrl: "https://worker.example/downloads/dl_x",
+        expiresAt: "2026-11-04T00:15:00.000Z",
+      })),
+    };
     const server = new McpServer({ name: "test", version: "1" });
-    registerMailTools(server, { icloud: icloud.icloud, google: gmail.google });
+    registerMailTools(server, { icloud: icloud.icloud, google: gmail.google, uploads });
     const client = new Client({ name: "test", version: "1" });
     const [a, b] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(a), client.connect(b)]);
@@ -317,6 +331,44 @@ describe("mail tools", () => {
     expect(icloudRow.snippet).toBe("Hi Peter, Your invoice for October is attached. Café");
     const gmailRow = found.messages.find((m: any) => m.account === ME);
     expect(gmailRow).toMatchObject({ category: "primary", labels: ["INBOX", "Projects"] });
+  });
+
+  it("reads previews only for the rows a search returns", async () => {
+    // The same message UID in INBOX and Sent: two candidates, one returned.
+    const found = await call("mail_search", { with: "bob", accounts: ["iCloud"], limit: 1 });
+    expect(found.messages).toHaveLength(1);
+    expect(found.messages[0].snippet).toMatch(/^Hi Peter/);
+    expect(icloud.previews).toEqual([found.messages[0].folder]);
+  });
+
+  it("gives a Gmail attachment's download link its file name", async () => {
+    const link = await call("mail_get_attachment", { id: `gmail:a:${ME}:m1:att1`, link: true });
+    expect(link).toEqual({
+      id: `gmail:a:${ME}:m1:att1`,
+      size: 8,
+      filename: "menu.pdf",
+      mimeType: "application/pdf",
+      downloadUrl: "https://worker.example/downloads/dl_x",
+      expiresAt: "2026-11-04T00:15:00.000Z",
+    });
+    const [file] = uploads.share.mock.calls[0];
+    expect(file.filename).toBe("menu.pdf");
+    expect(file.content.toString()).toBe("%PDF-1.7");
+
+    const inline = await call("mail_get_attachment", { id: `gmail:a:${ME}:m1:att1` });
+    expect(inline.contentBase64).toBe(Buffer.from("%PDF-1.7").toString("base64"));
+    expect(uploads.share).toHaveBeenCalledTimes(1);
+  });
+
+  it("saves a display name for a Gmail address and sends with it", async () => {
+    const settings = await call("mail_settings", {
+      displayName: "Work Me",
+      displayNameFrom: WORK,
+    });
+    expect(settings.gmailDisplayNames).toEqual({ [WORK]: "Work Me" });
+    await call("mail_create_draft", { from: WORK, to: ["amy@example.com"], body: "Hi" });
+    const upload = gmail.calls.findLast((c) => c.url.includes("/upload/gmail/v1/users/me/drafts"))!;
+    expect(upload.raw).toMatch(/^From: Work Me <work@gmail\.com>\r$/m);
   });
 
   it("lists folders with how many messages each holds and how many are unread", async () => {

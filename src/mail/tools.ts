@@ -484,18 +484,17 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
     return ctx.withImap(async (client) => {
       const paths = imapFolderPaths((await client.list()) as Mailbox[], query.folder);
       const criteria = imapCriteria(query);
-      const rows: MailRow[] = [];
+      const found: Array<{ row: MailRow; path: string; uid: number; text?: TextPart }> = [];
       let total = 0;
       for (const path of paths) {
         const lock = await client.getMailboxLock(path);
         try {
-          const found = await client.search(criteria, { uid: true });
-          const uids = Array.isArray(found) ? found : [];
-          total += uids.length;
+          const uids = await client.search(criteria, { uid: true });
+          const matched = Array.isArray(uids) ? uids : [];
+          total += matched.length;
           // UIDs grow with arrival, so the newest are last.
-          const recent = uids.slice(-(offset + limit));
+          const recent = matched.slice(-(offset + limit));
           if (!recent.length) continue;
-          const fetched = new Map<number, { row: MailRow; text?: TextPart }>();
           for await (const message of client.fetch(
             recent.join(","),
             { envelope: true, flags: true, bodyStructure: true },
@@ -503,29 +502,44 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
           )) {
             const envelope = message.envelope ?? {};
             const cc = addresses(envelope.cc);
-            const row: MailRow = {
-              id: encodeImapId(ctx.account, path, message.uid),
-              account: ctx.account,
-              folder: path,
-              date: envelope.date ? new Date(envelope.date).toISOString() : undefined,
-              from: addresses(envelope.from)[0] ?? "",
-              to: addresses(envelope.to),
-              ...(cc.length && { cc }),
-              subject: envelope.subject || "(no subject)",
-              unread: !message.flags?.has("\\Seen"),
-              flagged: message.flags?.has("\\Flagged") ?? false,
-            };
-            rows.push(row);
-            fetched.set(message.uid, { row, text: previewPart(message.bodyStructure) });
+            found.push({
+              row: {
+                id: encodeImapId(ctx.account, path, message.uid),
+                account: ctx.account,
+                folder: path,
+                date: envelope.date ? new Date(envelope.date).toISOString() : undefined,
+                from: addresses(envelope.from)[0] ?? "",
+                to: addresses(envelope.to),
+                ...(cc.length && { cc }),
+                subject: envelope.subject || "(no subject)",
+                unread: !message.flags?.has("\\Seen"),
+                flagged: message.flags?.has("\\Flagged") ?? false,
+              },
+              path,
+              uid: message.uid,
+              text: previewPart(message.bodyStructure),
+            });
           }
-          await addSnippets(client, fetched).catch(() => undefined);
         } finally {
           lock.release();
         }
       }
-      rows.sort((a, b) => (b.date ?? "").localeCompare(a.date ?? ""));
+      found.sort((a, b) => (b.row.date ?? "").localeCompare(a.row.date ?? ""));
+      const page = found.slice(offset, offset + limit);
+      // Snippets only for the rows returned, not every candidate of every folder.
+      for (const path of new Set(page.map((item) => item.path))) {
+        const lock = await client.getMailboxLock(path);
+        try {
+          const rows = page.filter((item) => item.path === path);
+          await addSnippets(client, new Map(rows.map((item) => [item.uid, item]))).catch(
+            () => undefined
+          );
+        } finally {
+          lock.release();
+        }
+      }
       return {
-        messages: rows.slice(offset, offset + limit),
+        messages: page.map((item) => item.row),
         next: offset + limit < total ? offset + limit : undefined,
       };
     });
@@ -955,6 +969,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
       }) => ({
         id: args.id,
         size: file.size,
+        filename: file.filename,
         ...(file.mimeType && { mimeType: file.mimeType }),
         ...(await uploads!.share({
           filename: file.filename,
@@ -966,14 +981,18 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
       if (parsed) {
         const account = (await accountOf(args.id)).name;
         const split = parsed.id.indexOf(":");
-        const result = await needGmail().gmail.getAttachment(
-          account,
-          parsed.id.slice(0, split),
-          parsed.id.slice(split + 1)
-        );
+        const [message, attachment] = [parsed.id.slice(0, split), parsed.id.slice(split + 1)];
+        const { gmail } = needGmail();
+        const result = await gmail.getAttachment(account, message, attachment);
         if ((args as { link?: boolean }).link) {
-          // Gmail's attachment ID carries no file name; curl -o names the file.
-          return asLink({ ...result, filename: "attachment" });
+          // Gmail's attachment ID carries no file name, so the message's parts give it.
+          const info = await gmail
+            .attachmentInfo(account, message, attachment, result.size)
+            .catch((error) => {
+              console.warn("Could not name a Gmail attachment:", (error as Error).message);
+              return {} as { filename?: string; mimeType?: string };
+            });
+          return asLink({ ...result, filename: info.filename ?? "attachment", ...info });
         }
         return { id: args.id, size: result.size, contentBase64: result.contentBase64 };
       }

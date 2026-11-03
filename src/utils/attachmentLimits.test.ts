@@ -31,7 +31,8 @@ describe("inline attachment size limits", () => {
     expect(MAX_INLINE_ATTACHMENT_BASE64_INPUT_CHARS).toBe(MAX_INLINE_ATTACHMENT_BASE64_CHARS * 2);
   });
 
-  it("accepts RFC-2045-wrapped base64 near the decoded limit", () => {
+  // Wrapping ~24 MiB of base64 takes seconds, more when the suite runs in parallel.
+  it("accepts RFC-2045-wrapped base64 near the decoded limit", { timeout: 30_000 }, () => {
     const byteLength = Math.floor(MAX_INLINE_ATTACHMENT_BYTES * 0.98);
     const encoded = Buffer.alloc(byteLength, 0x61).toString("base64");
     const wrapped = encoded.replace(/.{76}/g, "$&\r\n");
