@@ -1536,6 +1536,7 @@ export async function imapFetchAttachment(
   base64?: string;
   bytes?: number;
   mimeType?: string;
+  filename?: string;
   error?: string;
 }> {
   const ref = decodeImapId(id);
@@ -1563,6 +1564,7 @@ export async function imapFetchAttachment(
       base64: buf.toString("base64"),
       bytes: buf.length,
       mimeType: match.mimeType,
+      filename: match.filename,
     };
   });
 }

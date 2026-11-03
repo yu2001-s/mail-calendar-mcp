@@ -116,12 +116,17 @@ export function parseSettings(value: unknown): Settings {
   };
 }
 
+/** The name saved for `address` itself, without the default. */
+export function addressDisplayName(settings: Settings, address: string): string | undefined {
+  return (
+    Object.entries(settings.displayNames ?? {}).find(([key]) => sameAddress(key, address))?.[1] ||
+    undefined
+  );
+}
+
 /** The name shown with `address`: its own, else the default, else none. */
 export function displayNameFor(settings: Settings, address: string): string | undefined {
-  const own = Object.entries(settings.displayNames ?? {}).find(([key]) =>
-    sameAddress(key, address)
-  )?.[1];
-  return own || settings.displayName || undefined;
+  return addressDisplayName(settings, address) || settings.displayName || undefined;
 }
 
 /** `"Name" <address>`, or the bare address when it has no name. */
@@ -132,9 +137,16 @@ export function formatSender(settings: Settings, address: string): string {
 
 /**
  * Set or, with an empty name, clear a display name: the default for every
- * address when `from` is omitted, otherwise one address's own name.
+ * iCloud address when `from` is omitted, otherwise one address's own name.
+ * `others`: sending addresses outside iCloud, such as linked Gmail accounts,
+ * that may have a name too; the default never applies to them.
  */
-export function applyDisplayName(settings: Settings, name: string, from?: string): Settings {
+export function applyDisplayName(
+  settings: Settings,
+  name: string,
+  from?: string,
+  others: string[] = []
+): Settings {
   const clean = name.replace(/\s+/g, " ").trim();
   if (clean.length > 100 || /[<>"\\]/.test(clean)) {
     throw new Error('A display name is up to 100 characters without < > " or \\.');
@@ -144,7 +156,7 @@ export function applyDisplayName(settings: Settings, name: string, from?: string
     if (!clean) delete next.displayName;
     return next;
   }
-  const address = settings.addresses.find((item) => sameAddress(item, from));
+  const address = [...settings.addresses, ...others].find((item) => sameAddress(item, from));
   if (!address) throw new Error(`"${from}" is not a sending address.`);
   const displayNames = Object.fromEntries(
     Object.entries(settings.displayNames ?? {}).filter(([key]) => !sameAddress(key, address))

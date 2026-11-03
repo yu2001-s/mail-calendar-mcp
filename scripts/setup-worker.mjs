@@ -144,6 +144,12 @@ function ensureUploadsBucket() {
           conditions: { prefix: "uploads/" },
           deleteObjectsTransition: { condition: { type: "Age", maxAge: 24 * 60 * 60 } },
         },
+        {
+          id: "delete-downloads-after-a-day",
+          enabled: true,
+          conditions: { prefix: "downloads/" },
+          deleteObjectsTransition: { condition: { type: "Age", maxAge: 24 * 60 * 60 } },
+        },
       ],
     })
   );

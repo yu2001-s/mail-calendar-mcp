@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MAX_INLINE_ATTACHMENT_BYTES } from "@/utils/attachmentLimits.js";
-import { handleUpload, workerUploads, type R2 } from "@/worker/uploads.js";
+import { handleDownload, handleUpload, workerUploads, type R2 } from "@/worker/uploads.js";
 
 const origin = "https://mail.example";
 const secret = "0123456789abcdef0123456789abcdef";
@@ -189,5 +189,36 @@ describe("attachment uploads", () => {
     const ticket = await uploads.create("Bob's notes (final).txt");
     expect(ticket.uploadUrl).not.toContain("'");
     expect(new URL(ticket.uploadUrl).searchParams.get("filename")).toBe("Bob's notes (final).txt");
+  });
+});
+
+describe("attachment downloads", () => {
+  it("serves a shared file to its signed link until the link expires", async () => {
+    const { env, uploads } = setup();
+    const link = await uploads.share({
+      filename: "Q3 報告.pdf",
+      content: Buffer.from("%PDF-1.7"),
+      contentType: "application/pdf",
+    });
+    expect(link.downloadUrl).toMatch(/^https:\/\/mail\.example\/downloads\/dl_[A-Za-z0-9_-]{22}\?/);
+
+    const response = await handleDownload(new Request(link.downloadUrl), env);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("application/pdf");
+    expect(response.headers.get("Content-Disposition")).toBe(
+      `attachment; filename*=UTF-8''${encodeURIComponent("Q3 報告.pdf")}`
+    );
+    expect(await response.text()).toBe("%PDF-1.7");
+
+    const tampered = new URL(link.downloadUrl);
+    tampered.searchParams.set("expires", "9999999999");
+    expect((await handleDownload(new Request(tampered.href), env)).status).toBe(403);
+    expect(
+      (await handleDownload(new Request(link.downloadUrl, { method: "POST" }), env)).status
+    ).toBe(405);
+
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 16 * 60 * 1000);
+    expect((await handleDownload(new Request(link.downloadUrl), env)).status).toBe(410);
   });
 });

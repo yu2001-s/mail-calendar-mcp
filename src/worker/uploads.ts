@@ -7,8 +7,11 @@
  * Durable Object reads the file back when a draft attaches it and then leaves
  * an empty marker in its place, so the URL stays used until it expires; a
  * lifecycle rule (scripts/setup-worker.mjs) removes markers and leftovers.
+ *
+ * /downloads/<id> is the other way: mail_get_attachment keeps a copy of an
+ * attachment and signs a GET link to it, valid for LINK_TTL_S.
  */
-import type { UploadedFile, Uploads, UploadTicket } from "../mcp/uploads.js";
+import type { DownloadLink, UploadedFile, Uploads, UploadTicket } from "../mcp/uploads.js";
 import { UPLOAD_ID_PATTERN } from "../mcp/uploads.js";
 import { MAX_INLINE_ATTACHMENT_BYTES } from "../utils/attachmentLimits.js";
 
@@ -40,6 +43,8 @@ const LINK_TTL_S = 15 * 60;
 /** How long an uploaded file stays attachable. */
 const KEEP_MS = 24 * 60 * 60 * 1000;
 const PREFIX = "uploads/";
+const DOWNLOADS = "downloads/";
+const DOWNLOAD_ID = /^dl_[A-Za-z0-9_-]{22}$/;
 /** Custom metadata of the empty object left in place of an attached upload. */
 const ATTACHED = { attached: "1" };
 
@@ -71,6 +76,10 @@ async function signingKey(secret: string): Promise<CryptoKey> {
 
 function signedText(uploadId: string, expires: number, filename: string): Uint8Array<ArrayBuffer> {
   return new TextEncoder().encode(`upload\n${uploadId}\n${expires}\n${filename}`);
+}
+
+function downloadText(downloadId: string, expires: number): Uint8Array<ArrayBuffer> {
+  return new TextEncoder().encode(`download\n${downloadId}\n${expires}`);
 }
 
 /** A file name without folders or control characters. */
@@ -156,6 +165,31 @@ export function workerUploads(env: UploadEnv, origin: string): Uploads | undefin
           bucket.put(PREFIX + id, new Uint8Array(), { customMetadata: ATTACHED })
         )
       );
+    },
+
+    async share(file): Promise<DownloadLink> {
+      const downloadId = `dl_${base64url(crypto.getRandomValues(new Uint8Array(16)))}`;
+      const expires = Math.floor(Date.now() / 1000) + LINK_TTL_S;
+      await bucket.put(DOWNLOADS + downloadId, new Uint8Array(file.content), {
+        httpMetadata: file.contentType ? { contentType: file.contentType } : undefined,
+        customMetadata: {
+          filename: plainName(file.filename) ? file.filename : "attachment",
+          expires: String(expires),
+        },
+      });
+      const signature = await crypto.subtle.sign(
+        "HMAC",
+        await signingKey(secret),
+        downloadText(downloadId, expires)
+      );
+      const query = new URLSearchParams({
+        expires: String(expires),
+        signature: base64url(signature),
+      });
+      return {
+        downloadUrl: `${origin}/downloads/${downloadId}?${query}`,
+        expiresAt: new Date(expires * 1000).toISOString(),
+      };
     },
   };
 }
@@ -244,4 +278,43 @@ export async function handleUpload(request: Request, env: UploadEnv): Promise<Re
   });
   if (!stored) return json({ error: "This upload link was already used; create a new one." }, 409);
   return json({ uploadId, filename, size: bytes.length, sha256 }, 201);
+}
+
+/** Serve a file kept by share() to whoever holds its signed link, until it expires. */
+export async function handleDownload(request: Request, env: UploadEnv): Promise<Response> {
+  const url = new URL(request.url);
+  const downloadId = url.pathname.slice("/downloads/".length);
+  if (!DOWNLOAD_ID.test(downloadId)) return json({ error: "Not found." }, 404);
+  if (request.method !== "GET") {
+    return json({ error: "Download the file with GET, e.g. curl -o." }, 405, { Allow: "GET" });
+  }
+  const setup = configured(env);
+  if (!setup) return json({ error: "Downloads are not set up on this server." }, 501);
+  const expires = Number(url.searchParams.get("expires"));
+  const signature = new Uint8Array(
+    Buffer.from(url.searchParams.get("signature") ?? "", "base64url")
+  );
+  const valid =
+    Number.isSafeInteger(expires) &&
+    (await crypto.subtle.verify(
+      "HMAC",
+      await signingKey(setup.secret),
+      signature,
+      downloadText(downloadId, expires)
+    ));
+  if (!valid) return json({ error: "This download link is not valid." }, 403);
+  if (expires * 1000 < Date.now()) {
+    return json({ error: "This download link expired; get the attachment again." }, 410);
+  }
+  const object = await setup.bucket.get(DOWNLOADS + downloadId);
+  if (!object) return json({ error: "This file is no longer kept." }, 410);
+  const filename = object.customMetadata?.filename || "attachment";
+  return new Response(await object.arrayBuffer(), {
+    headers: {
+      "Cache-Control": "no-store",
+      "Content-Type": object.httpMetadata?.contentType || "application/octet-stream",
+      "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
 }

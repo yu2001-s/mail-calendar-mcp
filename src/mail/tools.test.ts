@@ -16,7 +16,7 @@ function gmailMessage(id: string, account: string, day: number) {
   return {
     id,
     threadId: `t-${id}`,
-    labelIds: ["INBOX", "UNREAD", "Label_1"],
+    labelIds: ["INBOX", "UNREAD", "Label_1", "CATEGORY_PERSONAL"],
     snippet: "Can we meet?",
     internalDate: String(Date.UTC(2026, 9, day, 9)),
     payload: {
@@ -72,9 +72,13 @@ function fakeGoogle() {
         labels: [
           { id: "INBOX", name: "INBOX", type: "system" },
           { id: "Label_1", name: "Projects", type: "user" },
+          { id: "CATEGORY_UPDATES", name: "CATEGORY_UPDATES", type: "system" },
         ],
       };
     }
+    if (url === `${API}/labels/INBOX`) return { id: "INBOX", messagesTotal: 12, messagesUnread: 3 };
+    if (url === `${API}/labels/Label_1`) return { id: "Label_1", messagesTotal: 4 };
+    if (url.startsWith(`${API}/drafts?`)) return { drafts: [{ id: "d1" }] };
     if (url === `${API}/settings/sendAs`) {
       return { sendAs: [{ sendAsEmail: account, isPrimary: true, isDefault: true }] };
     }
@@ -160,7 +164,24 @@ function fakeIcloud() {
     sourceKind: "imap" as const,
     hasAttachments: false,
   });
+  const saved = [
+    {
+      ...draft({ from: "peter@poieti.com", subject: "Budget", body: "Numbers for Q4" }),
+      updatedAt: "2026-11-01T09:00:00Z",
+    },
+    {
+      ...draft({ from: "peter@poieti.com", subject: "Trip", body: "Flights and the budget" }),
+      updatedAt: "2026-11-02T09:00:00Z",
+    },
+    {
+      ...draft({ from: "peter@poieti.com", subject: "Party", body: "Bring snacks" }),
+      updatedAt: "2026-11-03T09:00:00Z",
+    },
+  ];
   const drafts = {
+    async listDrafts() {
+      return { success: true, drafts: saved };
+    },
     async createDraft(input: any) {
       recorded.push(["createDraft", input]);
       return { success: true, draft: draft(input) };
@@ -173,10 +194,12 @@ function fakeIcloud() {
   const searches: Array<[string, unknown]> = [];
   let open = "";
   const client = {
-    async list() {
+    async list(options?: { statusQuery?: object }) {
+      const counts = (messages: number, unseen: number) =>
+        options?.statusQuery && { status: { messages, unseen } };
       return [
-        { path: "INBOX", name: "INBOX" },
-        { path: "Sent Messages", name: "Sent Messages", specialUse: "\\Sent" },
+        { path: "INBOX", name: "INBOX", ...counts(10, 2) },
+        { path: "Sent Messages", name: "Sent Messages", specialUse: "\\Sent", ...counts(5, 0) },
       ];
     },
     async getMailboxLock(path: string) {
@@ -187,9 +210,27 @@ function fakeIcloud() {
       searches.push([open, criteria]);
       return [7];
     },
-    async *fetch() {
+    async *fetch(_range: string, query: { bodyParts?: Array<{ key: string }> }) {
+      if (query.bodyParts) {
+        // The first bytes of the text part, cut mid-escape.
+        const text = "Hi Peter,\r\nYour invoice for Octo=\r\nber is attached. Caf=C3=A9 =C3";
+        yield { uid: 7, bodyParts: new Map([[query.bodyParts[0].key, Buffer.from(text)]]) };
+        return;
+      }
       yield {
         uid: 7,
+        bodyStructure: {
+          type: "multipart/mixed",
+          childNodes: [
+            {
+              part: "1",
+              type: "text/plain",
+              encoding: "quoted-printable",
+              parameters: { charset: "utf-8" },
+            },
+            { part: "2", type: "application/pdf", disposition: "attachment" },
+          ],
+        },
         envelope: {
           date: new Date(Date.UTC(2026, 9, 20, 9)),
           subject: "Invoice",
@@ -268,6 +309,38 @@ describe("mail tools", () => {
     expect(more.messages.map((m: any) => m.account)).toEqual([ME]);
     const next = gmail.calls.find((c) => c.url.startsWith(`${API}/messages?`))!;
     expect(new URL(next.url).searchParams.get("pageToken")).toBe("p2");
+  });
+
+  it("gives iCloud rows a snippet and Gmail rows their inbox tab", async () => {
+    const found = await call("mail_search", { unread: true });
+    const icloudRow = found.messages.find((m: any) => m.account === "iCloud");
+    expect(icloudRow.snippet).toBe("Hi Peter, Your invoice for October is attached. Café");
+    const gmailRow = found.messages.find((m: any) => m.account === ME);
+    expect(gmailRow).toMatchObject({ category: "primary", labels: ["INBOX", "Projects"] });
+  });
+
+  it("lists folders with how many messages each holds and how many are unread", async () => {
+    const { folders } = await call("mail_list_folders");
+    expect(folders).toEqual([
+      { account: "iCloud", name: "INBOX", special: "inbox", total: 10, unread: 2 },
+      { account: "iCloud", name: "Sent Messages", special: "sent", total: 5, unread: 0 },
+      { account: ME, name: "INBOX", special: "inbox", total: 12, unread: 3 },
+      { account: ME, name: "Projects", total: 4, unread: 0 },
+      { account: WORK, name: "INBOX", special: "inbox", total: 12, unread: 3 },
+      { account: WORK, name: "Projects", total: 4, unread: 0 },
+    ]);
+  });
+
+  it("lists drafts newest first, only those with the words asked for", async () => {
+    const { drafts } = await call("mail_list_drafts", { text: "BUDGET", accounts: ["iCloud", ME] });
+    expect(drafts.map((d: any) => [d.account, d.subject, d.date ?? null])).toEqual([
+      ["iCloud", "Trip", "2026-11-02T09:00:00Z"],
+      ["iCloud", "Budget", "2026-11-01T09:00:00Z"],
+      [ME, "Re: Lunch", null],
+    ]);
+    expect(drafts[0].snippet).toBe("Flights and the budget");
+    const query = gmail.calls.find((c) => c.url.startsWith(`${API}/drafts?`))!;
+    expect(new URL(query.url).searchParams.get("q")).toBe("BUDGET");
   });
 
   it("searches one person's mail both ways, in every folder unless given one", async () => {

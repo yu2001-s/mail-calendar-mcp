@@ -6,8 +6,10 @@ import {
   composeMime,
   Gmail,
   messageView,
+  nameAndAddress,
   uploadBody,
   type GmailMessage,
+  type GmailOptions,
 } from "./gmail.js";
 
 const ME = "me@gmail.com";
@@ -21,7 +23,7 @@ interface Call {
 }
 
 /** A GoogleAccounts stand-in that answers from `route` and records each call. */
-function fake(route: (method: string, url: string, body?: any) => any) {
+function fake(route: (method: string, url: string, body?: any) => any, options?: GmailOptions) {
   const calls: Call[] = [];
   const accounts = {
     manageUrl: "https://worker.example/accounts",
@@ -40,7 +42,7 @@ function fake(route: (method: string, url: string, body?: any) => any) {
       });
     },
   };
-  return { gmail: new Gmail(accounts as unknown as GoogleAccounts), calls };
+  return { gmail: new Gmail(accounts as unknown as GoogleAccounts, options), calls };
 }
 
 /** The message/rfc822 part of a multipart upload. */
@@ -163,6 +165,26 @@ describe("messageView", () => {
     });
     expect(text).toEqual([]);
     expect(attachments[0]).toMatchObject({ filename: "report.zip", attachmentId: "z" });
+  });
+});
+
+describe("nameAndAddress", () => {
+  it("splits a display name from its address", () => {
+    expect(nameAndAddress('"Huang, Shao" <s@example.com>')).toEqual({
+      name: "Huang, Shao",
+      address: "s@example.com",
+    });
+    expect(nameAndAddress("Shao Yu <s@example.com>")).toEqual({
+      name: "Shao Yu",
+      address: "s@example.com",
+    });
+    expect(nameAndAddress('"A \\"B\\"" <s@example.com>')).toEqual({
+      name: 'A "B"',
+      address: "s@example.com",
+    });
+    expect(nameAndAddress("<s@example.com>")).toEqual({ address: "s@example.com" });
+    expect(nameAndAddress("s@example.com <s@example.com>")).toEqual({ address: "s@example.com" });
+    expect(nameAndAddress(" s@example.com ")).toEqual({ address: "s@example.com" });
   });
 });
 
@@ -320,6 +342,88 @@ describe("Gmail", () => {
     expect(mime).toMatch(/^From: alias@example.com\r$/m);
     expect(mime).toMatch(/^To: dave@example.com, erin@example.com\r$/m);
     expect(mime).toMatch(/^Cc: frank@example.com\r$/m);
+  });
+
+  it("names a sender from saved names, then send-as, then the latest sent mail", async () => {
+    const sentMail = (_method: string, url: string) => {
+      if (url.includes("/messages?") && url.includes("in%3Asent")) {
+        return { messages: [{ id: "s1" }, { id: "s2" }] };
+      }
+      const from = url.includes("/messages/s1?")
+        ? "<alias@example.com>"
+        : url.includes("/messages/s2?")
+          ? '"Alias Person" <alias@example.com>'
+          : undefined;
+      return from && { payload: { headers: [{ name: "From", value: from }] } };
+    };
+    const draftFrom = async (gmail: Gmail, from: string, calls: Call[]) => {
+      await gmail.createDraft(ME, { from, to: ["x@example.com"], body: "Hi" });
+      const { mime } = uploadedMime(calls.findLast((call) => call.url.includes("/upload/"))!);
+      // Nodemailer quotes a name only when it needs quoting.
+      return /^From: (.*)\r$/m.exec(mime)![1].replace(/"/g, "");
+    };
+
+    const plain = fake(router(sentMail));
+    expect(await draftFrom(plain.gmail, "alias@example.com", plain.calls)).toBe(
+      "Alias Person <alias@example.com>"
+    );
+    expect(await draftFrom(plain.gmail, ME, plain.calls)).toBe("Me Myself <me@gmail.com>");
+    // Cached: the sent mail is looked up once.
+    await draftFrom(plain.gmail, "alias@example.com", plain.calls);
+    expect(plain.calls.filter((call) => call.url.includes("in%3Asent"))).toHaveLength(1);
+
+    const saved = fake(router(sentMail), {
+      displayName: (address) => (address === ME ? "Saved Name" : undefined),
+    });
+    expect(await draftFrom(saved.gmail, ME, saved.calls)).toBe("Saved Name <me@gmail.com>");
+  });
+
+  it("keeps a forwarded message when a draft's body is edited", async () => {
+    const forwarded = await composeMime({
+      from: "me@gmail.com",
+      to: ["a@example.com"],
+      subject: "Fwd: Plans",
+      text: "Old note\n\n---------- Forwarded message ---------\nFrom: Alice\n\nThe plan.",
+      html: "<p>Old note</p><br><div>---------- Forwarded message ---------<br>The plan.</div>",
+    });
+    const { gmail, calls } = fake(
+      router((method, url) => {
+        if (method === "GET" && url.includes("/drafts/d1")) {
+          return {
+            id: "d1",
+            message: { id: "dm", threadId: "t7", raw: forwarded.toString("base64url") },
+          };
+        }
+      })
+    );
+    await gmail.updateDraft(ME, "d1", { body: "New note" });
+    const kept = uploadedMime(calls.at(-1)!).mime;
+    expect(kept).toContain("New note");
+    expect(kept).toContain("The plan.");
+    expect(kept).not.toContain("Old note");
+    expect(kept.match(/Forwarded message/g)).toHaveLength(2);
+    await gmail.updateDraft(ME, "d1", { body: "Only this", keepQuoted: false });
+    const replaced = uploadedMime(calls.at(-1)!).mime;
+    expect(replaced).toContain("Only this");
+    expect(replaced).not.toContain("Forwarded message");
+  });
+
+  it("counts each label's messages in one batch", async () => {
+    const { gmail, calls } = fake(
+      router((_m, url) =>
+        url.includes("/labels/INBOX")
+          ? { id: "INBOX", messagesTotal: 12, messagesUnread: 3 }
+          : url.includes("/labels/Label_1")
+            ? { id: "Label_1", messagesTotal: 4 }
+            : undefined
+      )
+    );
+    const counts = await gmail.labelCounts(ME, ["INBOX", "Label_1"]);
+    expect(Object.fromEntries(counts)).toEqual({
+      INBOX: { total: 12, unread: 3 },
+      Label_1: { total: 4, unread: 0 },
+    });
+    expect(calls).toHaveLength(2);
   });
 
   it("creates a reply draft that quotes the original HTML", async () => {

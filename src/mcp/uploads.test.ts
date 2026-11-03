@@ -16,6 +16,7 @@ function fakeUploads(): Uploads & {
       sha256: "",
     })),
     delete: vi.fn(async () => undefined),
+    share: vi.fn(),
   };
 }
 
