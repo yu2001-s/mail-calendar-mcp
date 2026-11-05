@@ -50,7 +50,13 @@ export function connectorInstructions(parts: {
 
 export async function createConnectorServer(
   services: ConnectorServices,
-  options: { uploads?: Uploads; websiteUrl?: string; mailListeners?: MailWatcher } = {}
+  options: {
+    uploads?: Uploads;
+    websiteUrl?: string;
+    mailListeners?: MailWatcher;
+    /** The OAuth grant behind this request; webhooks it sets end with it. */
+    mailListenGrant?: string;
+  } = {}
 ): Promise<McpServer> {
   const { icloud, google } = services;
   // A display name saved here for a Gmail address goes on its mail too.
@@ -82,7 +88,7 @@ export async function createConnectorServer(
   );
   if (icloud || google) registerMailTools(server, { icloud, google, gmail, uploads });
   if (google) registerGoogleTools(server, google);
-  if (mailListeners) registerMailListenTools(server, mailListeners);
+  if (mailListeners) registerMailListenTools(server, mailListeners, options.mailListenGrant);
   if (uploads) registerUploadTool(server, uploads);
   registerTool(
     server,

@@ -24,6 +24,7 @@ import type { GoogleAccounts } from "../google/accounts.js";
 import { createConnectorServer } from "../mcp/server.js";
 import { MailWatcher, type WatchClient, type WatchStorage } from "../icloud/listeners.js";
 import { googleAccountsFor } from "./accounts.js";
+import { grantFromHeader, liveGrantIds } from "./grants.js";
 import { workerUploads } from "./uploads.js";
 import type { Env } from "./index.js";
 
@@ -129,6 +130,7 @@ export class MailSession {
       // call has selected, and the object can sleep between alarms.
       connect: async () =>
         (await this.connect(resolveImapConfig(process.env, ctx.account))) as unknown as WatchClient,
+      listGrants: () => liveGrantIds(this.env),
     });
     return this.watcher;
   }
@@ -164,6 +166,7 @@ export class MailSession {
         websiteUrl: `${origin}/`,
         uploads: workerUploads(this.env, origin),
         mailListeners: this.mailWatcher(),
+        mailListenGrant: grantFromHeader(request),
       }
     );
     const transport = new WebStandardStreamableHTTPServerTransport({

@@ -9,7 +9,7 @@
   // node:net/node:tls for IMAP and SMTP; strictly public fetches for CIMD documents.
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   // Kept in step with package.json by scripts/sync-version.mjs.
-  "define": { "CONNECTOR_VERSION": "\"2.0.0\"" },
+  "define": { "CONNECTOR_VERSION": "\"2.0.1\"" },
   "kv_namespaces": [{ "binding": "OAUTH_KV" }],
   // Files uploaded for attachments (create_attachment_upload). setup-worker.mjs
   // creates the bucket and a rule that deletes leftovers after a day.

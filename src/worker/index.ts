@@ -21,6 +21,7 @@ import { consentPage, messagePage, retryPage } from "./consent.js";
 import { CONNECTOR_TITLE } from "../mcp/identity.js";
 import { homePage, privacyPage } from "./pages.js";
 import { handleDownload, handleUpload, type R2 } from "./uploads.js";
+import { OWNER_USER_ID, stampGrantId, withGrantHeader } from "./grants.js";
 import {
   consentFormAction,
   failures,
@@ -70,7 +71,11 @@ export interface Env {
 }
 
 const mcpHandler = {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: { props?: { grantId?: string } }
+  ): Promise<Response> {
     if (request.method !== "POST") {
       return Response.json(
         { jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null },
@@ -94,7 +99,7 @@ const mcpHandler = {
     const session = env.MAIL_SESSION.get(env.MAIL_SESSION.idFromName("icloud"), {
       locationHint: "enam",
     });
-    return session.fetch(request);
+    return session.fetch(withGrantHeader(request, ctx.props?.grantId));
   },
 };
 
@@ -140,7 +145,7 @@ async function authorize(request: Request, env: Env): Promise<Response> {
     }
     const { redirectTo } = await oauth.completeAuthorization({
       request: approved.request,
-      userId: "owner",
+      userId: OWNER_USER_ID,
       metadata: {},
       scope: [MAIL_SCOPE],
       props: {},
@@ -204,6 +209,7 @@ function providerFor(origin: string, extraRedirects: string[]): OAuthProvider<En
       // needs approving again. A fixed lifetime signed every client out on schedule.
       refreshTokenTTL: GRANT_IDLE_TTL,
       refreshTokenIdleTTL: GRANT_IDLE_TTL,
+      tokenExchangeCallback: stampGrantId,
       clientRegistrationCallback: ({ clientMetadata }) => {
         const uris = Array.isArray(clientMetadata.redirect_uris)
           ? clientMetadata.redirect_uris

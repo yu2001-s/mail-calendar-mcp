@@ -4,6 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { decodeImapId } from "@/services/imapClient.js";
 import {
+  GRANT_CHECK_INTERVAL_MS,
   MAX_ATTEMPTS,
   MAX_PER_RUN,
   POLL_INTERVAL_MS,
@@ -124,11 +125,14 @@ function setup(options: { status?: () => number; junk?: boolean } = {}) {
     return new Response(null, { status: options.status?.() ?? 204 });
   });
   const log = vi.fn();
+  let grants = ["grant-a"];
+  const listGrants = vi.fn(async () => grants);
   const watcher = new MailWatcher({
     storage,
     imapAccount: "iCloud",
     primaryAddress: async () => PRIMARY,
     connect: server.connect,
+    listGrants,
     fetch: fetchImpl,
     now: () => now,
     log,
@@ -141,6 +145,8 @@ function setup(options: { status?: () => number; junk?: boolean } = {}) {
     posts,
     fetchImpl,
     log,
+    listGrants,
+    setGrants: (ids: string[]) => (grants = ids),
     advance: (ms: number) => (now += ms),
     newWatcher: () =>
       new MailWatcher({
@@ -148,6 +154,7 @@ function setup(options: { status?: () => number; junk?: boolean } = {}) {
         imapAccount: "iCloud",
         primaryAddress: async () => PRIMARY,
         connect: server.connect,
+        listGrants,
         fetch: fetchImpl,
         now: () => now,
         log,
@@ -461,6 +468,147 @@ describe("retries", () => {
       lastUid: 3,
       pendingRetry: null,
     });
+  });
+});
+
+describe("listeners end with their OAuth connection", () => {
+  const stateKeys = (t: ReturnType<typeof setup>) =>
+    [...t.storage.data.keys()].filter((k) => k.startsWith("mail-listen-state:"));
+
+  it("stops delivery once its grant is gone, then removes it and its headers", async () => {
+    const t = setup();
+    await t.watcher.set(
+      { name: "courier", url: HOOK, headers: { Authorization: "Bearer dummy" } },
+      "grant-a"
+    );
+    // Another connection staying approved does not keep this one's listener.
+    t.setGrants(["grant-b"]);
+    t.boxes.INBOX.messages.push(mail(3));
+
+    t.advance(POLL_INTERVAL_MS);
+    await t.watcher.poll();
+    expect(t.posts).toEqual([]);
+    expect(await t.watcher.listeners()).toHaveLength(1);
+    expect((await t.watcher.list())[0]).toMatchObject({ deliveryHeld: true });
+    expect(t.storage.alarm()).not.toBeNull();
+
+    t.advance(GRANT_CHECK_INTERVAL_MS);
+    await t.watcher.poll();
+    expect(t.posts).toEqual([]);
+    expect(await t.watcher.listeners()).toEqual([]);
+    expect(stateKeys(t)).toEqual([]);
+    expect(JSON.stringify([...t.storage.data])).not.toContain("Bearer dummy");
+    expect(t.storage.alarm()).toBeNull();
+    expect(t.log).toHaveBeenCalledWith(expect.stringContaining('"courier" ended'));
+  });
+
+  it("does not end a listener on one missed read, and sends the held mail", async () => {
+    const t = setup();
+    await t.watcher.set({ name: "courier", url: HOOK }, "grant-new");
+    t.setGrants([]);
+    t.boxes.INBOX.messages.push(mail(3));
+    t.advance(POLL_INTERVAL_MS);
+    await t.watcher.poll();
+    expect(t.posts).toEqual([]);
+
+    t.setGrants(["grant-new"]);
+    t.advance(GRANT_CHECK_INTERVAL_MS);
+    await t.watcher.poll();
+    expect(t.posts.map((p) => p.body.message.subject)).toEqual(["Subject 3"]);
+    expect((await t.watcher.list())[0]).not.toHaveProperty("deliveryHeld");
+  });
+
+  it("does not count a second read soon after the first as a later check", async () => {
+    const t = setup();
+    await t.watcher.set({ name: "first", url: HOOK }, "grant-new");
+    t.setGrants([]);
+    t.advance(POLL_INTERVAL_MS);
+    await t.watcher.poll();
+    // Setting a listener forces a fresh read on the next poll.
+    await t.watcher.set({ name: "second", url: HOOK });
+    t.advance(POLL_INTERVAL_MS);
+    await t.watcher.poll();
+    expect((await t.watcher.listeners()).map((l) => l.name)).toEqual(["first", "second"]);
+  });
+
+  it("delivers nothing and keeps the listener when the grants cannot be read", async () => {
+    const t = setup();
+    await t.watcher.set({ name: "courier", url: HOOK }, "grant-a");
+    t.boxes.INBOX.messages.push(mail(3));
+    t.listGrants.mockRejectedValueOnce(new Error("KV unavailable"));
+    t.advance(POLL_INTERVAL_MS);
+    await t.watcher.poll();
+    expect(t.posts).toEqual([]);
+    expect(t.server.connect).toHaveBeenCalledTimes(1); // The baseline, not this poll.
+    expect(await t.watcher.listeners()).toHaveLength(1);
+    expect(t.storage.alarm()).not.toBeNull();
+    expect(t.log).toHaveBeenCalledWith(expect.stringContaining("KV unavailable"));
+
+    t.advance(POLL_INTERVAL_MS);
+    await t.watcher.poll();
+    expect(t.posts).toHaveLength(1);
+  });
+
+  it("keeps a listener with no recorded grant until no grant is left", async () => {
+    const t = setup();
+    await t.watcher.set({ name: "older", url: HOOK });
+    t.setGrants(["grant-b"]);
+    t.boxes.INBOX.messages.push(mail(3));
+    t.advance(POLL_INTERVAL_MS);
+    await t.watcher.poll();
+    expect(t.posts).toHaveLength(1);
+    expect((await t.watcher.list())[0].endsWhen).toBe("every connection is revoked or expired");
+
+    t.setGrants([]);
+    t.boxes.INBOX.messages.push(mail(4));
+    t.advance(GRANT_CHECK_INTERVAL_MS);
+    await t.watcher.poll();
+    t.advance(GRANT_CHECK_INTERVAL_MS);
+    await t.watcher.poll();
+    expect(t.posts).toHaveLength(1);
+    expect(await t.watcher.listeners()).toEqual([]);
+  });
+
+  it("reads the grants once per interval, and again after a listener is set", async () => {
+    const t = setup();
+    await t.watcher.set({ name: "courier", url: HOOK }, "grant-a");
+    for (let i = 0; i < 3; i++) {
+      t.advance(POLL_INTERVAL_MS);
+      await t.watcher.poll();
+    }
+    expect(t.listGrants).toHaveBeenCalledTimes(1);
+    t.advance(GRANT_CHECK_INTERVAL_MS);
+    await t.watcher.poll();
+    expect(t.listGrants).toHaveBeenCalledTimes(2);
+    await t.watcher.set({ name: "other", url: HOOK }, "grant-a");
+    await t.watcher.poll();
+    expect(t.listGrants).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not read the grants when there are no listeners", async () => {
+    const t = setup();
+    await t.watcher.poll();
+    expect(t.listGrants).not.toHaveBeenCalled();
+  });
+
+  it("records the grant from the tool call and does not show its ID", async () => {
+    const t = setup();
+    const server = new McpServer({ name: "test", version: "0" });
+    registerMailListenTools(server, t.watcher, "grant-a");
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "c", version: "0" });
+    await Promise.all([server.connect(a), client.connect(b)]);
+    const set = await client.callTool({
+      name: "mail_listen_set",
+      arguments: { name: "courier", url: HOOK },
+    });
+    expect(JSON.stringify(set.content)).not.toContain("grant-a");
+    expect((await t.watcher.listeners())[0].grantId).toBe("grant-a");
+    const listed = await client.callTool({ name: "mail_listen_list", arguments: {} });
+    expect(JSON.stringify(listed.content)).not.toContain("grant-a");
+    expect(JSON.parse((listed.content as any)[0].text)[0].endsWhen).toBe(
+      "its connection is revoked or expires"
+    );
   });
 });
 

@@ -165,6 +165,14 @@ refused. The iCloud inbox holds mail for every address on the account, so a
 listener hears all of them. Webhook URLs must be https; `mail_listen_list`
 shows header names but not their values.
 
+A listener ends with the OAuth connection that set it. Grants are checked every
+five minutes: once a check misses the grant, delivery stops, and a check at
+least five minutes later removes the listener and its stored headers. If the
+grant turns up in between, the held mail goes out. A listener set before
+connections were recorded has none of its own, so it ends when no connection is
+left; setting it again ties it to the connection that does so. `mail_listen_list`
+shows which applies as `endsWhen`, and `deliveryHeld` while delivery is stopped.
+
 ## Security
 
 - `@cloudflare/workers-oauth-provider` implements OAuth 2.1: PKCE, single-use
@@ -194,8 +202,9 @@ shows header names but not their values.
 
 To revoke every connection, delete the entries in the Worker's `OAUTH_KV`
 namespace from the Cloudflare dashboard; each client then has to be approved
-again with the owner password. Leave `google-accounts:v1` in place unless you
-also mean to unlink every Google account.
+again with the owner password. New-mail webhooks stop with them, within about
+five minutes. Leave `google-accounts:v1` in place unless you also mean to unlink
+every Google account.
 
 ## How it works
 

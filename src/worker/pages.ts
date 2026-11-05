@@ -34,7 +34,7 @@ export function privacyPage(): Response {
     `<h1>Privacy policy</h1>
 <p>This connector is run by its owner for their own accounts only.</p>
 <h2>Data accessed</h2>
-<p>With the owner's approval it accesses the owner's iCloud mail, and for each Google account the owner links, Gmail (read, compose, send, labels, trash) and Google Calendar (calendars and events). It does so only when the owner's AI assistant calls one of its tools.</p>
+<p>With the owner's approval it accesses the owner's iCloud mail, and for each Google account the owner links, Gmail (read, compose, send, labels, trash) and Google Calendar (calendars and events). It does so when the owner's AI assistant calls one of its tools. If an assistant registers a new-mail webhook, it also checks iCloud mail about once a minute and sends each new message's sender, recipients, subject and date to that webhook, until the webhook is removed or the connection that set it is revoked or expires.</p>
 <h2>Data stored</h2>
 <p>It stores the OAuth grants of approved assistants, the owner's mail settings and signatures, and an encrypted refresh token for each linked Google account. Mail and calendar content is not stored; it is passed to the requesting assistant and discarded.</p>
 <h2>Sharing</h2>
