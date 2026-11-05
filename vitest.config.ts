@@ -6,6 +6,7 @@ export default defineConfig({
     globals: true,
     environment: "node",
     include: ["src/**/*.test.ts"],
+    server: { deps: { inline: ["@cloudflare/workers-oauth-provider"] } },
     coverage: {
       provider: "v8",
       reporter: ["text", "lcov", "json-summary"],
@@ -32,6 +33,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      "cloudflare:workers": path.resolve(__dirname, "./test/cloudflare-workers-stub.ts"),
     },
   },
 });

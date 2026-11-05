@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **New-mail webhooks end with the connection that set them.** A webhook ran
+  from Durable Object storage with no link to OAuth, so revoking a client or
+  letting its grant lapse left its webhook receiving each new message's sender,
+  recipients and subject. Access tokens now carry their grant ID, `mail_listen_set`
+  records it, and the alarm checks every five minutes that the grant still
+  exists. A missing grant stops delivery at once and removes the listener on a
+  later check; if the grants cannot be read, nothing is delivered on that run.
+  Webhooks set earlier have no recorded connection, so they end when no connection
+  is left. The privacy page now describes webhooks.
 - **Read a whole conversation, in any account.** `mail_read` takes
   `thread: true` with any message ID and returns the conversation the message
   is in, oldest first, so its last message is where it stands. iCloud has no

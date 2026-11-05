@@ -10,6 +10,8 @@
  * event per message. The last UID and UIDVALIDITY are stored per listener and
  * mailbox, so restarts never replay mail; a new listener starts from the
  * newest message without backfilling.
+ *
+ * A listener ends with the OAuth grant that set it; see authorizedListeners.
  */
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -25,6 +27,8 @@ export const MAX_BACKOFF_MS = 30 * 60_000;
 export const MAX_PER_RUN = 25;
 /** UIDs fetched per mailbox per run. */
 export const MAX_FETCH_UIDS = 200;
+/** How often listeners are checked against the OAuth grants; KV limits list operations per day. */
+export const GRANT_CHECK_INTERVAL_MS = 5 * 60_000;
 const TIMEOUT_MS = 10_000;
 const MAX_LISTENERS = 20;
 
@@ -38,6 +42,19 @@ export interface MailListener {
   account: string;
   mailboxes: WatchableMailbox[];
   createdAt: string;
+  /**
+   * The OAuth grant that set it. A listener set before grants were recorded has
+   * none and ends only when no grant is left.
+   */
+  grantId?: string;
+  /** When a check first missed its grant. Delivery waits until a later check decides. */
+  grantMissingAt?: number;
+}
+
+/** The result of the last read of the OAuth grants. */
+interface GrantCheck {
+  at: number;
+  ids: string[];
 }
 
 export interface MailboxState {
@@ -102,6 +119,8 @@ export interface WatcherDeps {
   primaryAddress: () => Promise<string>;
   /** Opens a dedicated IMAP connection; the watcher logs it out. */
   connect: () => Promise<WatchClient>;
+  /** The IDs of the OAuth grants that exist. Rejects if they cannot be read. */
+  listGrants: () => Promise<string[]>;
   fetch?: Fetch;
   now?: () => number;
   log?: (message: string) => void;
@@ -116,6 +135,7 @@ export interface MailListenInput {
 }
 
 const LISTENERS_KEY = "mail-listeners";
+const GRANT_CHECK_KEY = "mail-grant-check";
 const stateKey = (name: string, mailbox: string) =>
   `mail-listen-state:${JSON.stringify([name, mailbox])}`;
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
@@ -130,9 +150,14 @@ function errorText(e: unknown): string {
 
 /** Header names only: values often hold webhook secrets. */
 function redact(listener: MailListener) {
+  const { grantId, grantMissingAt, ...shown } = listener;
   return {
-    ...listener,
+    ...shown,
     headers: Object.fromEntries(Object.keys(listener.headers).map((k) => [k, "(set)"])),
+    endsWhen: grantId
+      ? "its connection is revoked or expires"
+      : "every connection is revoked or expired",
+    ...(grantMissingAt === undefined ? {} : { deliveryHeld: true }),
   };
 }
 
@@ -181,7 +206,7 @@ export class MailWatcher {
     );
   }
 
-  async set(input: MailListenInput) {
+  async set(input: MailListenInput, grantId?: string) {
     const name = input.name.trim();
     if (!name) throw new Error("Give the listener a name.");
     let url: URL;
@@ -204,12 +229,15 @@ export class MailWatcher {
       account,
       mailboxes,
       createdAt: new Date(this.now()).toISOString(),
+      ...(grantId ? { grantId } : {}),
     };
     const others = (await this.listeners()).filter((l) => l.name !== name);
     if (others.length >= MAX_LISTENERS) throw new Error(`At most ${MAX_LISTENERS} listeners.`);
     // A replacement starts over from the newest message.
     await this.clearState(name);
     await this.deps.storage.put(LISTENERS_KEY, [...others, listener]);
+    // Its grant may be newer than the last check.
+    await this.deps.storage.delete(GRANT_CHECK_KEY);
     let baseline: string;
     try {
       const marks = await this.baseline(listener);
@@ -265,7 +293,7 @@ export class MailWatcher {
   /** One poll of every watched mailbox; run from the Durable Object alarm. */
   async poll(): Promise<void> {
     try {
-      const listeners = await this.listeners();
+      const listeners = await this.authorizedListeners();
       if (listeners.length === 0) return;
       await this.withClient(async (client) => {
         for (const mailbox of WATCHABLE_MAILBOXES) {
@@ -283,6 +311,50 @@ export class MailWatcher {
     } finally {
       await this.schedule();
     }
+  }
+
+  private async grantCheck(): Promise<GrantCheck> {
+    const last = await this.deps.storage.get<GrantCheck>(GRANT_CHECK_KEY);
+    if (last && this.now() - last.at < GRANT_CHECK_INTERVAL_MS) return last;
+    const check = { at: this.now(), ids: await this.deps.listGrants() };
+    await this.deps.storage.put(GRANT_CHECK_KEY, check);
+    return check;
+  }
+
+  /**
+   * The listeners allowed to receive mail on this run. Revoking a grant or
+   * letting it lapse has to end the data flow it set up, and nothing tells this
+   * object when that happens, so it checks.
+   *
+   * A missing grant first only holds delivery, and a check at least an interval
+   * later ends the listener. KV is eventually consistent, so a new grant can
+   * briefly be missing, and ending a listener loses its stored headers for good.
+   * Held mail goes out if the grant turns up. If the grants cannot be read this
+   * rejects, so nothing is delivered on that run.
+   */
+  private async authorizedListeners(): Promise<MailListener[]> {
+    if ((await this.listeners()).length === 0) return [];
+    const { at, ids } = await this.grantCheck();
+    // Read after that network call, so a listener set during it is not overwritten below.
+    const all = await this.listeners();
+    const kept: MailListener[] = [];
+    for (const l of all) {
+      const live = l.grantId ? ids.includes(l.grantId) : ids.length > 0;
+      if (!live && l.grantMissingAt !== undefined) {
+        if (at - l.grantMissingAt >= GRANT_CHECK_INTERVAL_MS) {
+          this.log(`"${l.name}" ended: the connection behind it is gone.`);
+          await this.clearState(l.name);
+          continue;
+        }
+      } else if (!live) {
+        this.log(`"${l.name}" held: the connection behind it was not found.`);
+      }
+      kept.push({ ...l, grantMissingAt: live ? undefined : (l.grantMissingAt ?? at) });
+    }
+    const changed =
+      kept.length !== all.length || kept.some((l, i) => l.grantMissingAt !== all[i].grantMissingAt);
+    if (changed) await this.deps.storage.put(LISTENERS_KEY, kept);
+    return kept.filter((l) => l.grantMissingAt === undefined);
   }
 
   private async clearState(name: string): Promise<void> {
@@ -458,13 +530,17 @@ export const MAIL_LISTEN_INSTRUCTIONS =
   "mail_listen_set POSTs the headers of new iCloud mail to a webhook.";
 
 /** Register mail_listen_set, mail_listen_list and mail_listen_remove. */
-export function registerMailListenTools(server: McpServer, watcher: MailWatcher): void {
+export function registerMailListenTools(
+  server: McpServer,
+  watcher: MailWatcher,
+  grantId?: string
+): void {
   registerTool(
     server,
     "mail_listen_set",
     {
       description:
-        "Registers a webhook for new iCloud mail. About once a minute, every new message in the chosen mailboxes is POSTed to url as JSON {text, listener, account, mailbox, message: {id, rfcMessageId, inReplyTo, from, to, subject, date}}; message.id works with mail_read and as replyTo in mail_create_draft. Headers only, never the body, and nothing is marked read. Each message is sent once; a new listener starts with mail that arrives after it is set. Failed deliveries are retried with backoff. Setting an existing name replaces that listener. Only the iCloud account can be watched, not Gmail accounts.",
+        "Registers a webhook for new iCloud mail. About once a minute, every new message in the chosen mailboxes is POSTed to url as JSON {text, listener, account, mailbox, message: {id, rfcMessageId, inReplyTo, from, to, subject, date}}; message.id works with mail_read and as replyTo in mail_create_draft. Headers only, never the body, and nothing is marked read. Each message is sent once; a new listener starts with mail that arrives after it is set. Failed deliveries are retried with backoff. Setting an existing name replaces that listener. The listener ends when the connection that set it is revoked or expires. Only the iCloud account can be watched, not Gmail accounts.",
       inputSchema: {
         name: z.string().min(1).max(100).describe("Name for this listener, e.g. your agent's name"),
         url: z.string().url().describe("https webhook to POST each new message to"),
@@ -493,14 +569,14 @@ export function registerMailListenTools(server: McpServer, watcher: MailWatcher)
         openWorldHint: true,
       },
     },
-    (args: MailListenInput) => toolResult(() => watcher.set(args))
+    (args: MailListenInput) => toolResult(() => watcher.set(args, grantId))
   );
   registerTool(
     server,
     "mail_listen_list",
     {
       description:
-        "Lists the new-mail webhooks: name, url, account, mailboxes, header names (values hidden), and the last delivered UID and any pending retry per mailbox.",
+        "Lists the new-mail webhooks: name, url, account, mailboxes, header names (values hidden), when each ends, and the last delivered UID and any pending retry per mailbox. deliveryHeld means the connection behind it was not found, so nothing is sent until a later check.",
       inputSchema: {},
       annotations: {
         readOnlyHint: true,
