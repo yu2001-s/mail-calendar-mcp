@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Other Workers can serve the connector.** The named entrypoint `AgentMcp`
+  answers MCP at `/mcp` for a Worker that binds it (`{"service":
+  "icloud-mail", "entrypoint": "AgentMcp"}`), such as a hub behind Cloudflare
+  Access, as an approved owner connection would. It needs no token because
+  only a service binding reaches it; the public `/mcp` still requires OAuth.
 - **New-mail webhooks end with the connection that set them.** A webhook ran
   from Durable Object storage with no link to OAuth, so revoking a client or
   letting its grant lapse left its webhook receiving each new message's sender,

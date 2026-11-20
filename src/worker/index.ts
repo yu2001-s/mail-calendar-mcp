@@ -15,6 +15,7 @@ import {
   OAuthProvider,
   type OAuthHelpers,
 } from "@cloudflare/workers-oauth-provider";
+import { WorkerEntrypoint } from "cloudflare:workers";
 import { isAllowedRedirect, parseRedirectList } from "../icloud/redirects.js";
 import { handleAccounts } from "./accounts.js";
 import { consentPage, messagePage, retryPage } from "./consent.js";
@@ -103,6 +104,9 @@ const mcpHandler = {
   },
 };
 
+/** The props of an owner grant; each access token adds its grant ID (stampGrantId). */
+const OWNER_PROPS = {};
+
 async function authorize(request: Request, env: Env): Promise<Response> {
   const oauth = env.OAUTH_PROVIDER;
   const ownerPassword = env.ICLOUD_MAIL_OWNER_PASSWORD ?? "";
@@ -148,7 +152,7 @@ async function authorize(request: Request, env: Env): Promise<Response> {
       userId: OWNER_USER_ID,
       metadata: {},
       scope: [MAIL_SCOPE],
-      props: {},
+      props: OWNER_PROPS,
     });
     approved.headers.set("Location", redirectTo);
     return new Response(null, { status: 302, headers: approved.headers });
@@ -181,6 +185,33 @@ const appHandler = {
     return new Response("Not found", { status: 404 });
   },
 };
+
+/** The API route as the OAuth library matches it: /mcp and the paths below it. */
+function isMcpPath(pathname: string): boolean {
+  return pathname === "/mcp" || pathname.startsWith("/mcp/");
+}
+
+/**
+ * MCP for other Workers of this account, such as the mcp-hub, which call it
+ * through a service binding `{"service": "icloud-mail", "entrypoint": "AgentMcp"}`
+ * with URLs like https://agent.internal/mcp. It serves what an owner's
+ * authorized request to the public /mcp gets, with the props of an owner grant.
+ *
+ * It asks for no token because a named entrypoint is reachable only through a
+ * service binding, never from the internet; the internet reaches only the
+ * default export, where OAuth guards /mcp. Whoever binds it is trusted as the
+ * owner. A call has no OAuth grant, so a webhook it sets ends only when no
+ * grant is left (src/icloud/listeners.ts), like those set before grants were
+ * recorded.
+ */
+export class AgentMcp extends WorkerEntrypoint<Env> {
+  async fetch(request: Request): Promise<Response> {
+    if (!isMcpPath(new URL(request.url).pathname)) {
+      return new Response("Not found", { status: 404 });
+    }
+    return mcpHandler.fetch(request, this.env, { props: OWNER_PROPS });
+  }
+}
 
 const GRANT_IDLE_TTL = 90 * 24 * 60 * 60;
 
