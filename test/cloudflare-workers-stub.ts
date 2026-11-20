@@ -1,3 +1,8 @@
-// Stands in for the workerd-only module the OAuth library imports, so unit tests
-// can run the library's real code. Nothing in those tests uses this class.
-export class WorkerEntrypoint {}
+// Stands in for the workerd-only module that the Worker and the OAuth library
+// import, so unit tests can run their real code. Like workerd, it keeps env.
+export class WorkerEntrypoint<Env = unknown> {
+  constructor(
+    protected ctx: unknown,
+    protected env: Env
+  ) {}
+}

@@ -91,6 +91,11 @@ that asks for the owner password.
   ```sh
   claude mcp add --transport http icloud-mail https://icloud-mail.<your-subdomain>.workers.dev/mcp
   ```
+- **Other Workers** in the same Cloudflare account, such as an MCP hub, bind
+  the named entrypoint `AgentMcp` (`{"service": "icloud-mail", "entrypoint":
+  "AgentMcp"}`) and send MCP to `/mcp` on any hostname. It serves what an
+  approved owner connection gets, without OAuth: a named entrypoint is reached
+  only through a service binding, never from the internet.
 
 After changing tool parameters, deploy the Worker, then open the existing
 iCloud Mail plugin in ChatGPT, choose **Manage**, and select **Refresh tools**.
@@ -169,8 +174,8 @@ A listener ends with the OAuth connection that set it. Grants are checked every
 five minutes: once a check misses the grant, delivery stops, and a check at
 least five minutes later removes the listener and its stored headers. If the
 grant turns up in between, the held mail goes out. A listener set before
-connections were recorded has none of its own, so it ends when no connection is
-left; setting it again ties it to the connection that does so. `mail_listen_list`
+connections were recorded, or through `AgentMcp`, has none of its own, so it
+ends when no connection is left; setting it again ties it to the connection that does so. `mail_listen_list`
 shows which applies as `endsWhen`, and `deliveryHeld` while delivery is stopped.
 
 ## Security
