@@ -952,21 +952,39 @@ function specialMailboxFallbacks(kind: ImapSpecialMailbox): string[] {
     : ["Sent", "Sent Messages", "Sent Mail", "[Gmail]/Sent Mail"];
 }
 
+/**
+ * Where a connection found its Drafts and Sent mailboxes. A send looks them up
+ * five times, and a LIST costs a round trip each; they do not move while the
+ * connection is open.
+ */
+const SPECIAL_PATHS = Symbol("specialMailboxPaths");
+
 async function resolveSpecialMailboxPath(
   client: ImapClientLike,
   kind: ImapSpecialMailbox
 ): Promise<string> {
+  const known = ((client as { [SPECIAL_PATHS]?: Map<ImapSpecialMailbox, string> })[
+    SPECIAL_PATHS
+  ] ??= new Map());
+  const cached = known.get(kind);
+  if (cached) return cached;
   const boxes = await client.list();
   const flag = specialUseFlag(kind);
   const special = boxes.find((box) => box.specialUse?.toLowerCase() === flag);
-  if (special) return special.path;
+  if (special) {
+    known.set(kind, special.path);
+    return special.path;
+  }
   for (const fallback of specialMailboxFallbacks(kind)) {
     const match = boxes.find(
       (box) =>
         box.path.toLowerCase() === fallback.toLowerCase() ||
         box.name.toLowerCase() === fallback.toLowerCase()
     );
-    if (match) return match.path;
+    if (match) {
+      known.set(kind, match.path);
+      return match.path;
+    }
   }
   throw new Error(
     `IMAP account does not expose a ${kind === "drafts" ? "Drafts" : "Sent"} mailbox.`

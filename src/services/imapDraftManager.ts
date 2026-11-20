@@ -129,7 +129,6 @@ export interface ImapDraftManagerOptions {
   imapAccount?: (identity: SendingIdentity) => string;
   smtpConfig: (identity: SendingIdentity) => SmtpConfig;
   smtpSend?: typeof sendRawViaSmtp;
-  sleep?: (ms: number) => Promise<void>;
   /** Configured aliases excluded from reply recipients, or a getter for the current ones. */
   selfAddresses?: string[] | (() => string[]);
 }
@@ -166,7 +165,6 @@ export class ImapDraftManager {
   private readonly accountForIdentity?: (identity: SendingIdentity) => string;
   private readonly smtpConfigResolver: (identity: SendingIdentity) => SmtpConfig;
   private readonly smtpSend: typeof sendRawViaSmtp;
-  private readonly sleep: (ms: number) => Promise<void>;
   private readonly selfAddressList: () => string[];
 
   constructor(options: ImapDraftManagerOptions) {
@@ -175,7 +173,6 @@ export class ImapDraftManager {
     this.accountForIdentity = options.imapAccount;
     this.smtpConfigResolver = options.smtpConfig;
     this.smtpSend = options.smtpSend ?? sendRawViaSmtp;
-    this.sleep = options.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const self = options.selfAddresses ?? [];
     this.selfAddressList = typeof self === "function" ? self : () => self;
   }
@@ -919,17 +916,17 @@ export class ImapDraftManager {
     account: string
   ): Promise<{ sentCopy: ImapRawMessage | null; warning?: string }> {
     const deps = this.depsForAccount(account);
-    const findSent = () =>
-      messageId
-        ? imapFindRawMessageByHeader("sent", { name: "Message-ID", value: messageId }, deps).catch(
-            () => null
-          )
-        : Promise.resolve(null);
-    let sentCopy = await findSent();
-    for (let attempt = 0; !sentCopy && messageId && attempt < 2; attempt += 1) {
-      await this.sleep(500);
-      sentCopy = await findSent();
-    }
+    // iCloud's SMTP keeps no Sent copy (measured: none appeared within a
+    // second, on every send), so the copy is appended at once instead of
+    // waited for; the one look first keeps a server that does save from
+    // getting two.
+    let sentCopy = messageId
+      ? await imapFindRawMessageByHeader(
+          "sent",
+          { name: "Message-ID", value: messageId },
+          deps
+        ).catch(() => null)
+      : null;
 
     let warning: string | undefined;
     if (!sentCopy && messageId) {

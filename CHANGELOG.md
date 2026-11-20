@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Sending takes about half as long.** Measured in the Worker, a send took
+  4.8 s: after SMTP accepted the message the connector looked for a Sent copy
+  three times with half a second between, though iCloud's SMTP never saves
+  one, and listed the mailboxes before each of five steps. It now looks once
+  and appends the copy at once, and each connection lists the mailboxes once.
+  A send takes 2.7 s, of which SMTP is 1.9 s; drafts lose a list too.
+
 - **Other Workers can serve the connector.** The named entrypoint `AgentMcp`
   answers MCP at `/mcp` for a Worker that binds it (`{"service":
   "icloud-mail", "entrypoint": "AgentMcp"}`), such as a hub behind Cloudflare
