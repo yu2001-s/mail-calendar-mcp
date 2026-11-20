@@ -148,7 +148,6 @@ function managerOptions(
       pass: "test-only",
       from: sender.email,
     }),
-    sleep: async () => undefined,
     ...overrides,
   };
 }
@@ -408,6 +407,45 @@ describe("IMAP-backed drafts", () => {
     expect(repeated.success).toBe(true);
     expect(repeated.warning).toMatch(/already sent/i);
     expect(smtpSend).toHaveBeenCalledTimes(1);
+  });
+
+  it("finds Drafts and Sent once per connection and appends the Sent copy without waiting for one", async () => {
+    const fake = fakeImap();
+    const client = fake.client as unknown as Record<string, (...args: any[]) => any>;
+    const list = vi.fn(client.list);
+    client.list = list;
+    const search = client.search;
+    const sentSearches = vi.fn();
+    let selected = "";
+    const lock = client.getMailboxLock;
+    client.getMailboxLock = async (path: string) => {
+      selected = path;
+      return lock(path);
+    };
+    client.search = async (...args: unknown[]) => {
+      if (selected === "Sent") sentSearches();
+      return search(...args);
+    };
+    const manager = new ImapDraftManager(
+      managerOptions(fake.client, {
+        smtpSend: async () => ({ success: true, messageId: "<smtp@example.com>" }),
+      })
+    );
+    const created = await manager.createDraft({
+      to: ["to@example.com"],
+      subject: "Fast",
+      body: "Body",
+    });
+
+    const sent = await manager.sendDraft(created.draft?.draftId as string, created.draft?.revision);
+
+    expect(sent.success).toBe(true);
+    expect(sent.warning).toBeUndefined();
+    expect(fake.boxes.get("Sent")?.size).toBe(1);
+    // Drafts for the new draft, Sent for the send: one LIST each, not one per step.
+    expect(list).toHaveBeenCalledTimes(2);
+    // Once before SMTP against a double send, once after it.
+    expect(sentSearches).toHaveBeenCalledTimes(2);
   });
 
   it("keeps the draft editable after a definite SMTP rejection", async () => {
