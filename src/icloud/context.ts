@@ -1,7 +1,7 @@
 import nodemailer from "nodemailer";
 import type { ImapFlow } from "../services/imapFlow.js";
 import { resolveImapConfig, decodeImapId, type ImapDeps } from "../services/imapClient.js";
-import { resolveSmtpConfig, sendRawViaSmtp } from "../services/smtpMailer.js";
+import { resolveSmtpConfig, sendRawViaSmtp, smtpSession } from "../services/smtpMailer.js";
 import { ImapDraftManager } from "../services/imapDraftManager.js";
 import type { SendingIdentity } from "../types.js";
 import {
@@ -99,6 +99,7 @@ export function loadContext(env: NodeJS.ProcessEnv, options: ContextOptions): Co
       return { ...resolveSmtpConfig(env), from, allowedFrom: [...settings.addresses] };
     },
     smtpSend: (raw, envelope, config) => sendRawViaSmtp(raw, envelope, config, tlsTransport),
+    smtpSession: () => smtpSession(tlsTransport),
   });
   async function withImap<T>(fn: (client: ImapFlow) => Promise<T>): Promise<T> {
     const cfg = resolveImapConfig(env, account);

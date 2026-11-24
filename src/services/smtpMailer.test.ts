@@ -4,7 +4,13 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { resolveSmtpConfig, sendRawViaSmtp, SMTP_ENV, type SmtpConfig } from "./smtpMailer.js";
+import {
+  resolveSmtpConfig,
+  sendRawViaSmtp,
+  smtpSession,
+  SMTP_ENV,
+  type SmtpConfig,
+} from "./smtpMailer.js";
 
 const baseEnv = {
   [SMTP_ENV.host]: "smtp.example.com",
@@ -134,5 +140,32 @@ describe("sendRawViaSmtp", () => {
         rejectedTransport as never
       )
     ).toMatchObject({ success: false, uncertain: false });
+  });
+});
+
+describe("smtpSession", () => {
+  it("logs in once for several messages and closes when done", async () => {
+    const sendMail = vi.fn().mockResolvedValue({ messageId: "<m@example.com>" });
+    const close = vi.fn();
+    const createTransport = vi.fn().mockReturnValue({ sendMail, close });
+    const session = smtpSession(createTransport as never);
+    const envelope = { from: "alice@example.com", to: ["to@example.com"] };
+
+    for (const text of ["one", "two", "three"]) {
+      expect(await session.send(Buffer.from(text), envelope, testConfig)).toMatchObject({
+        success: true,
+      });
+    }
+    // Refused before it reaches the server, like a single send.
+    expect(
+      await session.send(Buffer.from("x"), { ...envelope, from: "eve@example.com" }, testConfig)
+    ).toMatchObject({ success: false, error: expect.stringMatching(/not a configured sender/) });
+
+    expect(createTransport).toHaveBeenCalledTimes(1);
+    expect(createTransport.mock.calls[0][0]).toMatchObject({ pool: true, maxConnections: 1 });
+    expect(sendMail).toHaveBeenCalledTimes(3);
+    expect(close).not.toHaveBeenCalled();
+    session.close();
+    expect(close).toHaveBeenCalledTimes(1);
   });
 });

@@ -698,6 +698,30 @@ export class Gmail {
     });
   }
 
+  /** A message's headers by name, and when Gmail received or sent it. */
+  async messageHeaders(
+    account: string,
+    messageId: string,
+    names: string[]
+  ): Promise<{ headers: Record<string, string>; date?: string }> {
+    const message: GmailMessage = await this.get(
+      account,
+      `messages/${encodeURIComponent(messageId)}`,
+      { format: "metadata", metadataHeaders: names }
+    );
+    const headers: Record<string, string> = {};
+    for (const name of names) {
+      const value = header(message.payload?.headers, name);
+      if (value) headers[name] = value;
+    }
+    return {
+      headers,
+      ...(message.internalDate && {
+        date: new Date(Number(message.internalDate)).toISOString(),
+      }),
+    };
+  }
+
   async getMessage(
     account: string,
     messageId: string,

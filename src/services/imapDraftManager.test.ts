@@ -691,7 +691,12 @@ describe("drafts saved by other mail clients", () => {
       from: "sender@example.com",
       to: ["peggy@example.com", "murphy@example.com", "hidden@example.com"],
     });
-    expect(submitted.toString()).toBe(raw.toString().replace("Bcc: hidden@example.com\r\n", ""));
+    // Dated when it went, with the Message-ID it went out with.
+    const date = new Date(sent.sentAt!).toUTCString().replace(/GMT$/, "+0000");
+    expect(submitted.toString()).toBe(
+      `Date: ${date}\r\n${raw.toString().replace("Bcc: hidden@example.com\r\n", "")}`
+    );
+    expect(sent.messageId).toBe("<apple-mail-draft@example.com>");
     expect(fake.boxes.get("Drafts")?.size).toBe(0);
     expect(fake.boxes.get("Sent")?.size).toBe(1);
 

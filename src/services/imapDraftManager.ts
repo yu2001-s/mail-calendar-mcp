@@ -23,7 +23,13 @@ import {
   prepareDraftMimeForSend,
   type MimeDraftAttachment,
 } from "@/services/mimeDraft.js";
-import { sendRawViaSmtp, type SmtpConfig, type SmtpSendResult } from "@/services/smtpMailer.js";
+import {
+  sendRawViaSmtp,
+  type RawSmtpSend,
+  type SmtpConfig,
+  type SmtpSendResult,
+  type SmtpSession,
+} from "@/services/smtpMailer.js";
 import { buildReplyOptions, parseOriginalHeaders } from "@/services/replyForward.js";
 import { z } from "zod";
 
@@ -117,6 +123,12 @@ export interface ImapDraftResult {
   warning?: string;
   smtpMessageId?: string;
   sentMessageId?: string;
+  /** The sent message's Message-ID header. */
+  messageId?: string;
+  /** When SMTP took the message; also its Date header. */
+  sentAt?: string;
+  /** The SMTP connection failed mid-send: the message may or may not have gone. */
+  uncertain?: boolean;
 }
 
 /**
@@ -128,7 +140,9 @@ export interface ImapDraftManagerOptions {
   imapDeps?: (account: string) => ImapDeps;
   imapAccount?: (identity: SendingIdentity) => string;
   smtpConfig: (identity: SendingIdentity) => SmtpConfig;
-  smtpSend?: typeof sendRawViaSmtp;
+  smtpSend?: RawSmtpSend;
+  /** One SMTP login for a batch of sends; without it each send logs in. */
+  smtpSession?: () => SmtpSession;
   /** Configured aliases excluded from reply recipients, or a getter for the current ones. */
   selfAddresses?: string[] | (() => string[]);
 }
@@ -164,7 +178,8 @@ export class ImapDraftManager {
   private readonly depsForAccount: (account: string) => ImapDeps;
   private readonly accountForIdentity?: (identity: SendingIdentity) => string;
   private readonly smtpConfigResolver: (identity: SendingIdentity) => SmtpConfig;
-  private readonly smtpSend: typeof sendRawViaSmtp;
+  private readonly smtpSend: RawSmtpSend;
+  private readonly smtpSessionFactory?: () => SmtpSession;
   private readonly selfAddressList: () => string[];
 
   constructor(options: ImapDraftManagerOptions) {
@@ -173,6 +188,7 @@ export class ImapDraftManager {
     this.accountForIdentity = options.imapAccount;
     this.smtpConfigResolver = options.smtpConfig;
     this.smtpSend = options.smtpSend ?? sendRawViaSmtp;
+    this.smtpSessionFactory = options.smtpSession;
     const self = options.selfAddresses ?? [];
     this.selfAddressList = typeof self === "function" ? self : () => self;
   }
@@ -735,7 +751,17 @@ export class ImapDraftManager {
     }
   }
 
-  async sendDraft(draftId: string, expectedRevision?: string): Promise<ImapDraftResult> {
+  /** An SMTP session for sending several drafts; close it when done. */
+  openSmtpSession(): SmtpSession {
+    return this.smtpSessionFactory?.() ?? { send: this.smtpSend, close() {} };
+  }
+
+  /** Send a managed draft; `send` is a batch's shared SMTP session. */
+  async sendDraft(
+    draftId: string,
+    expectedRevision?: string,
+    send: RawSmtpSend = this.smtpSend
+  ): Promise<ImapDraftResult> {
     try {
       const uuid = draftUuid(draftId);
       let registry: ImapDraftRegistry;
@@ -818,10 +844,11 @@ export class ImapDraftManager {
         latest.remoteMarked = marked;
       });
 
-      const deliverable = prepareDraftMimeForSend(current.raw);
+      const sentAt = new Date();
+      const deliverable = prepareDraftMimeForSend(current.raw, sentAt);
       let sent: SmtpSendResult;
       try {
-        sent = await this.smtpSend(
+        sent = await send(
           deliverable,
           { from: identity.email, to: recipients.map(senderEmail) },
           config
@@ -853,6 +880,7 @@ export class ImapDraftManager {
           error: sent.uncertain
             ? `${sent.error ?? "SMTP outcome is uncertain."} Verify Sent before retrying.`
             : (sent.error ?? "SMTP send failed."),
+          ...(sent.uncertain && { uncertain: true }),
         };
       }
 
@@ -886,10 +914,15 @@ export class ImapDraftManager {
         ),
         smtpMessageId: sent.messageId,
         sentMessageId: sentCopy?.id,
+        messageId: parsed.messageId
+          ? `<${parsed.messageId.replace(/^<|>$/g, "")}>`
+          : sent.messageId,
+        sentAt: sentAt.toISOString(),
         warning,
       };
     } catch (error) {
       const uuid = draftUuid(draftId);
+      let uncertain = false;
       try {
         const registry = this.load();
         if (registry.drafts[uuid]?.state === "sending") {
@@ -897,11 +930,16 @@ export class ImapDraftManager {
           registry.drafts[uuid].warning =
             "Sending outcome is uncertain. Verify Sent before retrying.";
           this.save(registry);
+          uncertain = true;
         }
       } catch {
         // Preserve the original failure.
       }
-      return { success: false, error: error instanceof Error ? error.message : String(error) };
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        ...(uncertain && { uncertain }),
+      };
     }
   }
 
@@ -1045,12 +1083,16 @@ export class ImapDraftManager {
    * connector-managed draft is sent through sendDraft. The Drafts copy is
    * removed only after SMTP accepts the message.
    */
-  async sendImapDraft(imapId: string, expectedRevision?: string): Promise<ImapDraftResult> {
+  async sendImapDraft(
+    imapId: string,
+    expectedRevision?: string,
+    send: RawSmtpSend = this.smtpSend
+  ): Promise<ImapDraftResult> {
     let messageId: string | undefined;
     try {
       const loaded = await this.loadImapDraft(imapId);
       if ("error" in loaded) return { success: false, error: loaded.error };
-      if ("managedId" in loaded) return this.sendDraft(loaded.managedId, expectedRevision);
+      if ("managedId" in loaded) return this.sendDraft(loaded.managedId, expectedRevision, send);
       const { account, current, parsed } = loaded;
       const deps = this.depsForAccount(account);
       messageId = parsed.messageId;
@@ -1110,10 +1152,11 @@ export class ImapDraftManager {
       const marked = await imapSetKeyword(current.id, SENDING_KEYWORD, true, deps)
         .then((result) => result.success)
         .catch(() => false);
-      const deliverable = prepareDraftMimeForSend(current.raw);
+      const sentAt = new Date();
+      const deliverable = prepareDraftMimeForSend(current.raw, sentAt);
       let sent: SmtpSendResult;
       try {
-        sent = await this.smtpSend(
+        sent = await send(
           deliverable,
           { from: identity.email, to: recipients.map(senderEmail) },
           config
@@ -1140,6 +1183,7 @@ export class ImapDraftManager {
           error: sent.uncertain
             ? `${sent.error ?? "SMTP outcome is uncertain."} Verify Sent before retrying.`
             : (sent.error ?? "SMTP send failed."),
+          ...(sent.uncertain && { uncertain: true }),
         };
       }
 
@@ -1165,16 +1209,25 @@ export class ImapDraftManager {
         ),
         smtpMessageId: sent.messageId,
         sentMessageId: sentCopy?.id,
+        messageId: parsed.messageId
+          ? `<${parsed.messageId.replace(/^<|>$/g, "")}>`
+          : sent.messageId,
+        sentAt: sentAt.toISOString(),
         warning,
       };
     } catch (error) {
-      if (messageId && this.imapSends.get(messageId)?.state === "sending") {
-        this.imapSends.set(messageId, {
+      const uncertain = !!messageId && this.imapSends.get(messageId)?.state === "sending";
+      if (uncertain) {
+        this.imapSends.set(messageId!, {
           state: "needs_review",
           warning: "Sending outcome is uncertain. Verify Sent before retrying.",
         });
       }
-      return { success: false, error: error instanceof Error ? error.message : String(error) };
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        ...(uncertain && { uncertain }),
+      };
     }
   }
 

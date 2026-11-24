@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **A batch of different messages is two calls.** Sending six outreach
+  letters took twelve calls: a draft for each, which answered with its whole
+  body, then a send for each, with its revision copied over, each logging in
+  to SMTP again (3–4 s apiece, one after another). Then the agent had to
+  guess when each went, since `mail_send` returned no Message-ID or time, and
+  search the inbox for bounces itself. `mail_create_draft` now takes
+  `messages`, up to 20, and returns each draft's ID, revision, recipients and
+  subject, without the bodies, plus the signatures it added. `mail_send`
+  takes `drafts`, up to 20, sent in order over one SMTP connection: each
+  gets its own result, a refusal does not stop the rest, and an uncertain
+  outcome stops the batch so nothing after it can go twice. Five seconds
+  after the last one, the inbox of each account is checked for delivery
+  reports naming a sent message's Message-ID or recipient, and those rows
+  are marked `bounced` with the reason.
+- **`mail_send` says what went and when.** Each sent message comes back with
+  its Message-ID header, the time it went, its recipients and subject, from
+  iCloud and Gmail alike.
+- **An iCloud draft is dated when it is sent.** It kept the Date of when it
+  was saved, so a letter drafted at 1 a.m. and sent at 2 p.m. said 1 a.m.
+  and sorted below mail that arrived in between.
+
 - **Sending takes about half as long.** Measured in the Worker, a send took
   4.8 s: after SMTP accepted the message the connector looked for a Sent copy
   three times with half a second between, though iCloud's SMTP never saves

@@ -188,11 +188,31 @@ function fakeIcloud() {
       recorded.push(["createDraft", input]);
       return { success: true, draft: draft(input) };
     },
-    async sendDraft(id: string, revision: string) {
+    async sendDraft(id: string, revision: string, send?: unknown) {
       recorded.push(["sendDraft", [id, revision]]);
-      return { success: true, sentMessageId: "imap:sent" };
+      if (send) sessionSends.push(id);
+      if (id === "apple-draft:refused") return { success: false, error: "550 rejected" };
+      if (id === "apple-draft:lost") {
+        return { success: false, error: "socket closed", uncertain: true };
+      }
+      const to = id === "apple-draft:bad" ? "nobody@gone.example" : `${id.slice(12)}@example.com`;
+      return {
+        success: true,
+        sentMessageId: "imap:sent",
+        messageId: `<${id.slice(12)}@poieti.com>`,
+        sentAt: "2026-11-24T03:27:23.000Z",
+        draft: { ...draft({ from: "peter@poieti.com", to: [to], subject: `To ${to}` }) },
+      };
+    },
+    openSmtpSession() {
+      sessions.opened++;
+      return { send: async () => ({ success: true }), close: () => sessions.closed++ };
     },
   };
+  const sessionSends: string[] = [];
+  const sessions = { opened: 0, closed: 0 };
+  // Delivery reports in the inbox, by UID.
+  const reports = new Map<number, string>();
   const searches: Array<[string, unknown]> = [];
   const previews: string[] = [];
   let open = "";
@@ -209,11 +229,18 @@ function fakeIcloud() {
       open = path;
       return { release() {} };
     },
-    async search(criteria: unknown) {
+    async search(criteria: any) {
       searches.push([open, criteria]);
+      if (criteria.or?.some((c: any) => c.from === "mailer-daemon")) return [...reports.keys()];
       return [7];
     },
-    async *fetch(_range: string, query: { bodyParts?: Array<{ key: string }> }) {
+    async *fetch(range: string, query: { bodyParts?: Array<{ key: string }>; source?: object }) {
+      if (query.source) {
+        for (const uid of range.split(",").map(Number)) {
+          yield { uid, internalDate: new Date(), source: Buffer.from(reports.get(uid)!) };
+        }
+        return;
+      }
       if (query.bodyParts) {
         previews.push(open);
         // The first bytes of the text part, cut mid-escape.
@@ -266,7 +293,15 @@ function fakeIcloud() {
     checkId() {},
     serialize: <T>(fn: () => Promise<T>) => fn(),
   };
-  return { icloud: ctx as unknown as ConnectorContext, recorded, searches, previews };
+  return {
+    icloud: ctx as unknown as ConnectorContext,
+    recorded,
+    searches,
+    previews,
+    sessionSends,
+    sessions,
+    reports,
+  };
 }
 
 describe("mail tools", () => {
@@ -288,7 +323,12 @@ describe("mail tools", () => {
       })),
     };
     const server = new McpServer({ name: "test", version: "1" });
-    registerMailTools(server, { icloud: icloud.icloud, google: gmail.google, uploads });
+    registerMailTools(server, {
+      icloud: icloud.icloud,
+      google: gmail.google,
+      uploads,
+      bounceWaitMs: 0,
+    });
     const client = new Client({ name: "test", version: "1" });
     const [a, b] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(a), client.connect(b)]);
@@ -491,5 +531,136 @@ describe("mail tools", () => {
 
     await call("mail_update", { ids: [`gmail:t:${ME}:t-m1`], moveTo: "trash" });
     expect(gmail.calls.at(-1)!.url).toBe(`${API}/threads/t-m1/trash`);
+  });
+
+  it("saves several drafts in one call, without echoing their bodies", async () => {
+    const result = await call("mail_create_draft", {
+      messages: [
+        // A strict host sends null for every field it leaves unset.
+        { to: ["amy@example.com"], subject: "One", body: "First", cc: null, replyTo: null },
+        { from: "stranger@example.com", to: ["bob@example.com"], body: "Nope" },
+        { from: WORK, to: ["cat@example.com"], subject: "Two", body: "Second" },
+      ],
+    });
+    expect(result.created).toBe(2);
+    expect(result.failed).toBe(1);
+    expect(result.drafts[0]).toMatchObject({
+      draftId: "apple-draft:new",
+      revision: "r1",
+      account: "iCloud",
+      to: ["amy@example.com"],
+      subject: "One",
+    });
+    expect(result.drafts[0].body).toBeUndefined();
+    expect(result.drafts[1]).toEqual({
+      index: 1,
+      error: expect.stringMatching(/not a sending address/),
+    });
+    expect(result.drafts[2]).toMatchObject({ draftId: `gmail:d:${WORK}:d1`, account: WORK });
+    expect(result.drafts[2].body).toBeUndefined();
+    // Each signature is shown once, not once per draft.
+    expect(result.signatures).toEqual({ "peter@poieti.com": "Peter" });
+    expect(icloud.recorded[0]).toEqual([
+      "createDraft",
+      expect.objectContaining({ body: "First\n\nPeter" }),
+    ]);
+
+    await expect(
+      call("mail_create_draft", { to: ["amy@example.com"], messages: [{ to: ["b@example.com"] }] })
+    ).rejects.toThrow(/not both/);
+  });
+
+  it("sends several drafts over one login, each with its own result and bounce", async () => {
+    icloud.reports.set(
+      9,
+      [
+        "From: Mail Delivery System <mailer-daemon@icloud.com>",
+        "Subject: Undelivered Mail Returned to Sender",
+        "Content-Type: multipart/report; report-type=delivery-status; boundary=b",
+        "",
+        "--b",
+        "Content-Type: text/plain",
+        "",
+        "<nobody@gone.example>: host mx.gone.example said: 550 5.1.1 User unknown",
+        "--b",
+        "Content-Type: message/delivery-status",
+        "",
+        "Final-Recipient: rfc822; nobody@gone.example",
+        "Action: failed",
+        "Diagnostic-Code: smtp; 550 5.1.1 <nobody@gone.example>:",
+        " Recipient address rejected: User unknown",
+        "--b--",
+      ].join("\r\n")
+    );
+    const result = await call("mail_send", {
+      drafts: [
+        { draftId: "apple-draft:amy", revision: "r1" },
+        { draftId: "apple-draft:refused", revision: "r1" },
+        { draftId: "apple-draft:bad", revision: "r1" },
+        { draftId: `gmail:d:${ME}:d1`, revision: "dm1" },
+      ],
+    });
+    expect(result.results[0]).toEqual({
+      draftId: "apple-draft:amy",
+      sent: true,
+      account: "iCloud",
+      id: "imap:sent",
+      messageId: "<amy@poieti.com>",
+      sentAt: "2026-11-24T03:27:23.000Z",
+      to: ["amy@example.com"],
+      subject: "To amy@example.com",
+    });
+    // A refusal does not stop the drafts after it.
+    expect(result.results[1]).toEqual({
+      draftId: "apple-draft:refused",
+      sent: false,
+      error: "550 rejected",
+    });
+    expect(result.results[2].bounced).toEqual({
+      id: encodeImapId("iCloud", "INBOX", 9),
+      reason: "550 5.1.1 <nobody@gone.example>: Recipient address rejected: User unknown",
+    });
+    expect(result.results[3]).toMatchObject({
+      sent: true,
+      account: ME,
+      id: `gmail:m:${ME}:s1`,
+      messageId: "<s1@mail.example.com>",
+      subject: "Lunch",
+    });
+    expect(result).toMatchObject({ sent: 3, notSent: 1, bounced: 1 });
+    expect(icloud.sessionSends).toEqual([
+      "apple-draft:amy",
+      "apple-draft:refused",
+      "apple-draft:bad",
+    ]);
+    expect(icloud.sessions).toEqual({ opened: 1, closed: 1 });
+  });
+
+  it("stops a batch at an uncertain send, so nothing after it can go twice", async () => {
+    const result = await call("mail_send", {
+      drafts: [
+        { draftId: "apple-draft:amy", revision: "r1" },
+        { draftId: "apple-draft:lost", revision: "r1" },
+        { draftId: "apple-draft:bob", revision: "r1" },
+      ],
+    });
+    expect(result.results.map((row: any) => [row.sent, row.uncertain ?? false])).toEqual([
+      [true, false],
+      [false, true],
+      [false, false],
+    ]);
+    expect(result.results[2].notAttempted).toMatch(/apple-draft:lost is uncertain/);
+    expect(icloud.recorded.filter(([name]) => name === "sendDraft")).toHaveLength(2);
+    expect(icloud.sessions.closed).toBe(1);
+
+    await expect(
+      call("mail_send", {
+        drafts: [
+          { draftId: "apple-draft:amy", revision: "r1" },
+          { draftId: "apple-draft:amy", revision: "r1" },
+        ],
+      })
+    ).rejects.toThrow(/twice/);
+    await expect(call("mail_send", { draftId: "apple-draft:amy" })).rejects.toThrow(/revision/);
   });
 });

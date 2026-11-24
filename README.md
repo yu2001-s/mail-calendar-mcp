@@ -32,9 +32,9 @@ address picks the account it is sent from.
 | `mail_search` | every account at once, or some; inbox by default, any folder or label, newest first, one cursor for more; `with` finds your mail with one person both ways |
 | `mail_read` | a message, a whole conversation (`thread: true`, iCloud included, sent replies too), or a draft with its revision; attachment IDs |
 | `mail_get_attachment` | base64, up to 20 MiB |
-| `mail_create_draft` | a new message, a reply (`replyTo`) or a forward (`forward`, with attachments); saved signatures added |
+| `mail_create_draft` | a new message, a reply (`replyTo`) or a forward (`forward`, with attachments); saved signatures added; up to 20 different ones at once (`messages`) |
 | `mail_update_draft` | merge update, given the current revision |
-| `mail_send` | a draft as saved, given its current revision |
+| `mail_send` | a draft as saved, given its current revision, with the Message-ID and time it went; up to 20 at once (`drafts`) over one SMTP login, each with its own result and any bounce already back |
 | `mail_list_drafts`, `mail_delete_draft` | |
 | `mail_update` | read, flag, Gmail labels, and moves to inbox, archive, junk, trash or a folder |
 | `mail_list_folders`, `mail_manage_folder` | iCloud mailboxes and Gmail labels |
