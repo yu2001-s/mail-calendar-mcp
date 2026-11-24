@@ -82,6 +82,27 @@ describe("draft MIME composition", () => {
     expect(draftMimeRevision(raw)).toHaveLength(64);
   });
 
+  it("reads a long non-ASCII attachment name back as written, through a second save", async () => {
+    // nodemailer splits it into filename*0*, filename*1*, … and encoded-words in name.
+    const filename = "Poieti_產品介紹(手機閱讀版).pdf";
+    const compose = (attachments: { filename: string; content: Buffer }[]) =>
+      composeDraftMime({
+        draftUuid: "00000000-0000-4000-8000-000000000002",
+        from: "sender@example.com",
+        to: ["to@example.com"],
+        subject: "s",
+        body: "b",
+        attachments,
+      });
+    const first = parseDraftMime(await compose([{ filename, content: Buffer.from("pdf") }]));
+    expect(first.attachments.map((item) => item.filename)).toEqual([filename]);
+    // An edit keeps the attachment by the name it read back.
+    const second = parseDraftMime(
+      await compose(first.attachments.map(({ filename, content }) => ({ filename, content })))
+    );
+    expect(second.attachments.map((item) => item.filename)).toEqual([filename]);
+  });
+
   it("removes Bcc and private connector headers before SMTP delivery", async () => {
     const raw = await composeDraftMime({
       draftUuid: "00000000-0000-4000-8000-000000000001",

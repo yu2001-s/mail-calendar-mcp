@@ -5,7 +5,7 @@
  * addressing, subject-prefix and quoting rules are unit-testable without a
  * mail server.
  */
-import { decodeHeaderWord } from "@/services/mimeDraft.js";
+import { decodeHeaderWord } from "@/utils/mimeParse.js";
 import type { SmtpSendOptions } from "@/services/smtpMailer.js";
 
 /** The subset of an original message's headers we need to reply/forward. */

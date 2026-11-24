@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ImapClientLike, ImapConfig } from "@/services/imapClient.js";
 import { GRANT_CHECK_INTERVAL_MS } from "@/icloud/listeners.js";
 import { withGrantHeader } from "@/worker/grants.js";
-import { MailSession, persistentImap } from "@/worker/session.js";
+import { MailSession, persistentImap, PUBLIC_ORIGIN_HEADER } from "@/worker/session.js";
 
 const cfg = {
   host: "imap.example.com",
@@ -112,7 +112,7 @@ describe("persistent IMAP connection", () => {
 
 describe("new-mail webhooks after OAuth revocation", () => {
   // Runs the real session, MCP tool and OAuth library over synthetic storage.
-  function harness() {
+  function harness(extraEnv: Record<string, unknown> = {}) {
     const kv = new Map<string, string>();
     const OAUTH_KV = {
       async get(key: string, options?: { type?: string }) {
@@ -181,6 +181,7 @@ describe("new-mail webhooks after OAuth revocation", () => {
         APPLE_MAIL_MCP_SMTP_USER: "owner@example.com",
         APPLE_MAIL_MCP_SMTP_PASSWORD: "dummy",
         APPLE_MAIL_MCP_SMTP_FROM: "owner@example.com",
+        ...extraEnv,
       } as never,
       connect as never
     );
@@ -231,6 +232,40 @@ describe("new-mail webhooks after OAuth revocation", () => {
         ),
     };
   }
+
+  it("hands out upload links only on the public origin the Worker names", async () => {
+    const { session } = harness({
+      UPLOADS: {},
+      CONNECTOR_SECRET_KEY: "0123456789abcdef0123456789abcdef",
+    });
+    const call = async (origin?: string) => {
+      const request = new Request("https://agent.internal/mcp", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "create_attachment_upload", arguments: { filename: "a.pdf" } },
+        }),
+      });
+      if (origin) request.headers.set(PUBLIC_ORIGIN_HEADER, origin);
+      const { result } = (await (await session.fetch(request)).json()) as {
+        result: { content: { text: string }[]; isError?: boolean };
+      };
+      return result;
+    };
+    const linked = await call("https://icloud-mail.example.workers.dev");
+    expect(JSON.parse(linked.content[0].text).uploadUrl).toMatch(
+      /^https:\/\/icloud-mail\.example\.workers\.dev\/uploads\/up_/
+    );
+    const unlinked = await call();
+    expect(unlinked.isError).toBe(true);
+    expect(unlinked.content[0].text).not.toContain("agent.internal");
+  });
 
   it("stops when the grant is deleted from OAUTH_KV, as docs/WORKER.md instructs", async () => {
     const t = harness();

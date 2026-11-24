@@ -160,11 +160,36 @@ function ensureUploadsBucket() {
   }
 }
 
+/** Deploy, and return the workers.dev URL wrangler reports, if any. */
+function deploy() {
+  const result = spawnSync(wrangler, ["deploy"], {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["inherit", "pipe", "inherit"],
+  });
+  process.stdout.write(result.stdout ?? "");
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error("wrangler deploy failed.");
+  return /https:\/\/[\w.-]+\.workers\.dev/.exec(result.stdout ?? "")?.[0];
+}
+
+let deployedUrl;
 if (!process.argv.includes("--secrets")) {
   ensureUploadsBucket();
-  run(["deploy"]);
+  deployedUrl = deploy();
 }
 const existing = existingSecrets();
+// Links in tool results are built on it; a call through a service binding (the
+// mcp-hub) has no other way to know the Worker's public URL.
+if (process.env.ICLOUD_MAIL_PUBLIC_URL) {
+  secrets.ICLOUD_MAIL_PUBLIC_URL = process.env.ICLOUD_MAIL_PUBLIC_URL;
+} else if (!existing.has("ICLOUD_MAIL_PUBLIC_URL") && deployedUrl) {
+  secrets.ICLOUD_MAIL_PUBLIC_URL = deployedUrl;
+} else if (!existing.has("ICLOUD_MAIL_PUBLIC_URL")) {
+  console.warn(
+    "Set ICLOUD_MAIL_PUBLIC_URL to the Worker URL: without it, MCP through a service binding gets no attachment upload or download links."
+  );
+}
 let generated = false;
 if (chosen) secrets.ICLOUD_MAIL_OWNER_PASSWORD = chosen;
 else if (!existing.has("ICLOUD_MAIL_OWNER_PASSWORD")) {

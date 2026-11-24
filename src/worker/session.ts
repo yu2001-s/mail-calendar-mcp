@@ -28,6 +28,13 @@ import { grantFromHeader, liveGrantIds } from "./grants.js";
 import { workerUploads } from "./uploads.js";
 import type { Env } from "./index.js";
 
+/**
+ * The Worker's public origin, which the Worker sets on every request it passes
+ * to the session (replacing any a client sent) and tool results build links on.
+ * Absent when it has none: such a request gets no tools that hand out links.
+ */
+export const PUBLIC_ORIGIN_HEADER = "x-mail-public-origin";
+
 /** Close the IMAP connection after this long without a tool call. */
 export const IMAP_IDLE_MS = 3 * 60 * 1000;
 
@@ -150,21 +157,21 @@ export class MailSession {
     return this.context;
   }
 
-  private googleAccounts(origin: string): GoogleAccounts | undefined {
+  private googleAccounts(origin: string | undefined): GoogleAccounts | undefined {
     if (this.google === undefined) this.google = googleAccountsFor(this.env) ?? null;
-    if (this.google) this.google.manageUrl = `${origin}/accounts`;
+    if (this.google) this.google.manageUrl = `${origin ?? ""}/accounts`;
     return this.google ?? undefined;
   }
 
   async fetch(request: Request): Promise<Response> {
-    const origin = new URL(this.env.ICLOUD_MAIL_PUBLIC_URL || request.url).origin;
+    const origin = request.headers.get(PUBLIC_ORIGIN_HEADER) ?? undefined;
     const icloud = this.env.ICLOUD_MAIL_PREFERENCES ? this.connector() : undefined;
     await icloud?.refresh();
     const server = await createConnectorServer(
       { icloud, google: this.googleAccounts(origin) },
       {
-        websiteUrl: `${origin}/`,
-        uploads: workerUploads(this.env, origin),
+        websiteUrl: origin && `${origin}/`,
+        uploads: origin ? workerUploads(this.env, origin) : undefined,
         mailListeners: this.mailWatcher(),
         mailListenGrant: grantFromHeader(request),
       }

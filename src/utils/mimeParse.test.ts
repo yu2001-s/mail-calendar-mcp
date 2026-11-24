@@ -6,6 +6,7 @@ import {
   extractHtmlBody,
   extractRfcMessageIdFromSource,
   extractTextBody,
+  headerParameter,
 } from "./mimeParse.js";
 
 describe("extractRfcMessageIdFromSource", () => {
@@ -616,5 +617,58 @@ describe("decodePartPreview", () => {
       decodePartPreview(Buffer.from("Caf=C3=A9 au lait=\r\n ok=C3"), "quoted-printable", "utf-8")
     ).toBe("Café au lait ok");
     expect(decodePartPreview(Buffer.from([0xa7, 0x41, 0x6e]), "8bit", "big5")).toBe("你n");
+  });
+});
+
+describe("headerParameter", () => {
+  it("joins and decodes RFC 2231 continuations", () => {
+    const header =
+      "attachment; filename*0*=utf-8''Poieti_%E7%94%A2%E5%93%81%E4%BB%8B; filename*1*=%E7%B4%B9.pdf";
+    expect(headerParameter(header, "filename")).toBe("Poieti_產品介紹.pdf");
+  });
+
+  it("decodes RFC 2231 values in their charset, and unencoded pieces as they are", () => {
+    expect(headerParameter("attachment; filename*=big5''%B4%FA%B8%D5.txt", "filename")).toBe(
+      "測試.txt"
+    );
+    expect(
+      headerParameter('attachment; filename*0="long "; filename*1="name.txt"', "filename")
+    ).toBe("long name.txt");
+  });
+
+  it("decodes RFC 2047 encoded-words in a quoted value", () => {
+    const header =
+      'application/pdf; name="=?UTF-8?B?UG9pZXRpX+eUouWTgeS7i+e0uSjmiYvmqZ/plrE=?= =?UTF-8?B?6K6A54mIKS5wZGY=?="';
+    expect(headerParameter(header, "name")).toBe("Poieti_產品介紹(手機閱讀版).pdf");
+  });
+
+  it("prefers the extended value, reads quoted and bare values, and tells names apart", () => {
+    expect(
+      headerParameter("attachment; filename=\"plain.pdf\"; filename*=utf-8''%C3%A9.pdf", "filename")
+    ).toBe("é.pdf");
+    expect(headerParameter('attachment; filename="a \\"b\\".pdf"', "filename")).toBe('a "b".pdf');
+    expect(headerParameter("attachment; filename=bare.pdf; size=3", "filename")).toBe("bare.pdf");
+    expect(headerParameter('application/pdf; name="x.pdf"', "filename")).toBeNull();
+    expect(headerParameter('attachment; filename="x.pdf"', "name")).toBeNull();
+  });
+});
+
+describe("parseMimeAttachments — non-ASCII names", () => {
+  it("prefers Content-Disposition's RFC 2231 filename to Content-Type's encoded name", () => {
+    const source = [
+      'Content-Type: multipart/mixed; boundary="b"',
+      "",
+      "--b",
+      "Content-Type: application/pdf;",
+      ' name="=?UTF-8?B?5ris6KmmLnBkZg==?="',
+      "Content-Disposition: attachment;",
+      " filename*0*=utf-8''%E6%B8%AC; filename*1*=%E8%A9%A6.pdf",
+      "Content-Transfer-Encoding: base64",
+      "",
+      "cGRm",
+      "--b--",
+    ].join("\r\n");
+    expect(parseMimeAttachments(source).map((item) => item.name)).toEqual(["測試.pdf"]);
+    expect(extractMimeAttachment(source, "測試.pdf")?.data.toString()).toBe("pdf");
   });
 });

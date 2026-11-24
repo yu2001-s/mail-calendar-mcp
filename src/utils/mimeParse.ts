@@ -50,23 +50,100 @@ export function getMimeHeader(headers: string, name: string): string | null {
   return match[1].replace(/\r?\n[ \t]+/g, " ").trim();
 }
 
+/** Decode the RFC 2047 encoded-words (=?UTF-8?B?…?=) in a header value. */
+export function decodeHeaderWord(value: string): string {
+  // RFC 2047 says linear whitespace between adjacent encoded-words is only
+  // folding whitespace and must not appear in the decoded value. Nodemailer
+  // splits long subjects at arbitrary byte boundaries, so preserving that
+  // whitespace can turn "draft" into "draf t".
+  const withoutEncodedWordFolding = value.replace(/(\?=)[ \t\r\n]+(?==\?)/g, "$1");
+  return withoutEncodedWordFolding.replace(
+    /=\?([^?]+)\?([bq])\?([^?]+)\?=/gi,
+    (_whole, charset: string, encoding: string, encoded: string) => {
+      try {
+        const bytes =
+          encoding.toLowerCase() === "b"
+            ? Buffer.from(encoded, "base64")
+            : Buffer.from(
+                encoded
+                  .replace(/_/g, " ")
+                  .replace(/=([0-9a-f]{2})/gi, (_m, hex) =>
+                    String.fromCharCode(Number.parseInt(hex, 16))
+                  ),
+                "binary"
+              );
+        // RFC 2231 allows a language after the charset: =?big5*zh-TW?B?...?=
+        return decodeCharset(bytes, charset.split("*")[0]);
+      } catch {
+        return encoded;
+      }
+    }
+  );
+}
+
+/**
+ * The value of a header parameter such as Content-Disposition's filename,
+ * decoded. RFC 2231 extended values (`filename*=utf-8''…`, split into
+ * `filename*0*`, `filename*1*`, … when long) win over the plain one, which may
+ * itself hold RFC 2047 encoded-words: nodemailer writes a non-ASCII file name
+ * the first way in Content-Disposition and the second in Content-Type's name.
+ */
+export function headerParameter(header: string, name: string): string | null {
+  const params = [...header.matchAll(/;\s*([^\s=;]+)\s*=\s*("(?:[^"\\]|\\.)*"|[^;]*)/g)].map(
+    ([, key, raw]) => ({
+      key: key.toLowerCase(),
+      value: raw.startsWith('"') ? raw.slice(1, -1).replace(/\\(.)/g, "$1") : raw.trim(),
+    })
+  );
+  const wanted = name.toLowerCase();
+  const pieces = params
+    .map(({ key, value }) => {
+      const match = /^(.+?)(?:\*(\d+))?(\*)?$/.exec(key);
+      if (match?.[1] !== wanted || (match[2] === undefined && match[3] === undefined)) return null;
+      return { index: Number(match[2] ?? 0), encoded: match[3] === "*", value };
+    })
+    .filter((piece) => piece !== null)
+    .sort((a, b) => a.index - b.index);
+  if (pieces.length > 0) {
+    let charset = "utf-8";
+    const bytes: Buffer[] = [];
+    for (const [position, piece] of pieces.entries()) {
+      let value = piece.value;
+      if (piece.encoded && position === 0) {
+        const quote = /^([^']*)'[^']*'/.exec(value);
+        if (quote) {
+          charset = quote[1] || charset;
+          value = value.slice(quote[0].length);
+        }
+      }
+      bytes.push(
+        piece.encoded
+          ? Buffer.from(
+              value.replace(/%([0-9a-f]{2})/gi, (_m, hex: string) =>
+                String.fromCharCode(Number.parseInt(hex, 16))
+              ),
+              "latin1"
+            )
+          : Buffer.from(value, "utf8")
+      );
+    }
+    return decodeCharset(Buffer.concat(bytes), charset);
+  }
+  const plain = params.find(({ key }) => key === wanted);
+  return plain ? decodeHeaderWord(plain.value).trim() : null;
+}
+
 /**
  * Extract filename from Content-Disposition or Content-Type headers.
  */
 function extractFilename(headers: string): string | null {
-  // Try Content-Disposition filename first
-  const dispHeader = getMimeHeader(headers, "Content-Disposition");
-  if (dispHeader) {
-    const fnMatch = dispHeader.match(/filename="?([^";\r\n]+)"?/i);
-    if (fnMatch) return fnMatch[1].trim();
-  }
-  // Fall back to Content-Type name parameter
-  const ctHeader = getMimeHeader(headers, "Content-Type");
-  if (ctHeader) {
-    const nameMatch = ctHeader.match(/name="?([^";\r\n]+)"?/i);
-    if (nameMatch) return nameMatch[1].trim();
-  }
-  return null;
+  const disposition = getMimeHeader(headers, "Content-Disposition");
+  const contentType = getMimeHeader(headers, "Content-Type");
+  return (
+    (disposition && headerParameter(disposition, "filename")) ||
+    (contentType && headerParameter(contentType, "name")) ||
+    null
+  );
 }
 
 /**

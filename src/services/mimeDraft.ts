@@ -2,8 +2,8 @@ import { createHash } from "crypto";
 import nodemailer from "nodemailer";
 import type { Attachment, AttachmentInput } from "@/types.js";
 import { decodeInlineAttachment } from "@/utils/attachmentLimits.js";
-import { decodeCharset } from "@/utils/charset.js";
 import {
+  decodeHeaderWord,
   extractHtmlBody,
   extractRfcMessageIdFromSource,
   extractTextBody,
@@ -54,36 +54,6 @@ function splitHeaderBody(raw: string): { headers: string; body: string } {
   if (index < 0) return { headers: raw, body: "" };
   const separator = raw.slice(index).match(/^\r?\n\r?\n/)?.[0] ?? "\r\n\r\n";
   return { headers: raw.slice(0, index), body: raw.slice(index + separator.length) };
-}
-
-export function decodeHeaderWord(value: string): string {
-  // RFC 2047 says linear whitespace between adjacent encoded-words is only
-  // folding whitespace and must not appear in the decoded value. Nodemailer
-  // splits long subjects at arbitrary byte boundaries, so preserving that
-  // whitespace can turn "draft" into "draf t".
-  const withoutEncodedWordFolding = value.replace(/(\?=)[ \t\r\n]+(?==\?)/g, "$1");
-  return withoutEncodedWordFolding.replace(
-    /=\?([^?]+)\?([bq])\?([^?]+)\?=/gi,
-    (_whole, charset: string, encoding: string, encoded: string) => {
-      try {
-        const bytes =
-          encoding.toLowerCase() === "b"
-            ? Buffer.from(encoded, "base64")
-            : Buffer.from(
-                encoded
-                  .replace(/_/g, " ")
-                  .replace(/=([0-9a-f]{2})/gi, (_m, hex) =>
-                    String.fromCharCode(Number.parseInt(hex, 16))
-                  ),
-                "binary"
-              );
-        // RFC 2231 allows a language after the charset: =?big5*zh-TW?B?...?=
-        return decodeCharset(bytes, charset.split("*")[0]);
-      } catch {
-        return encoded;
-      }
-    }
-  );
 }
 
 export function splitAddresses(value: string | null): string[] {
