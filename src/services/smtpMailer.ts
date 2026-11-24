@@ -134,16 +134,31 @@ function senderAddress(value: string): string {
   return (angle?.[1] ?? value).trim().toLowerCase();
 }
 
-/**
- * Submit an already-composed RFC 5322 message without rebuilding its MIME.
- * The caller supplies the SMTP envelope separately so Bcc can be omitted from
- * delivered headers while those recipients still receive the message.
- */
-export async function sendRawViaSmtp(
+/** Sends composed messages; {@link sendRawViaSmtp} is one, a session's `send` another. */
+export type RawSmtpSend = (
   raw: Buffer,
   envelope: RawSmtpEnvelope,
-  config: SmtpConfig,
-  createTransport: typeof nodemailer.createTransport = nodemailer.createTransport
+  config: SmtpConfig
+) => Promise<SmtpSendResult>;
+
+/** Several messages over one SMTP login. */
+export interface SmtpSession {
+  send: RawSmtpSend;
+  close(): void;
+}
+
+/** What a send needs of a nodemailer transport, pooled or not. */
+interface Transporter {
+  sendMail(mail: { envelope: RawSmtpEnvelope; raw: Buffer }): Promise<{ messageId?: string }>;
+  close(): void;
+}
+
+/** The From check and the submission every send shares. */
+async function submitRaw(
+  transporter: () => Transporter,
+  raw: Buffer,
+  envelope: RawSmtpEnvelope,
+  config: SmtpConfig
 ): Promise<SmtpSendResult> {
   const requestedFrom = senderAddress(envelope.from);
   const allowedFrom = new Set(
@@ -158,15 +173,8 @@ export async function sendRawViaSmtp(
   if (envelope.to.length === 0) {
     return { success: false, error: "SMTP envelope has no recipients." };
   }
-
-  const transporter = createTransport({
-    host: config.host,
-    port: config.port,
-    secure: config.secure,
-    auth: { user: config.user, pass: config.pass },
-  });
   try {
-    const info = await transporter.sendMail({
+    const info = await transporter().sendMail({
       envelope: { from: requestedFrom, to: envelope.to },
       raw,
     });
@@ -183,7 +191,75 @@ export async function sendRawViaSmtp(
       error: `SMTP send failed: ${error instanceof Error ? error.message : String(error)}`,
       uncertain: responseCode === undefined,
     };
-  } finally {
-    transporter.close();
   }
+}
+
+function transportOptions(config: SmtpConfig) {
+  return {
+    host: config.host,
+    port: config.port,
+    secure: config.secure,
+    auth: { user: config.user, pass: config.pass },
+  };
+}
+
+/**
+ * Submit an already-composed RFC 5322 message without rebuilding its MIME.
+ * The caller supplies the SMTP envelope separately so Bcc can be omitted from
+ * delivered headers while those recipients still receive the message.
+ */
+export async function sendRawViaSmtp(
+  raw: Buffer,
+  envelope: RawSmtpEnvelope,
+  config: SmtpConfig,
+  createTransport: typeof nodemailer.createTransport = nodemailer.createTransport
+): Promise<SmtpSendResult> {
+  let transporter: Transporter | undefined;
+  try {
+    return await submitRaw(
+      () => (transporter = createTransport(transportOptions(config)) as Transporter),
+      raw,
+      envelope,
+      config
+    );
+  } finally {
+    transporter?.close();
+  }
+}
+
+/**
+ * Send several messages over one connection per server and login: the TLS
+ * handshake and AUTH, most of a send's time, happen once. Close it when done.
+ */
+export function smtpSession(
+  createTransport: typeof nodemailer.createTransport = nodemailer.createTransport
+): SmtpSession {
+  const open = new Map<string, Transporter>();
+  return {
+    send: (raw, envelope, config) =>
+      submitRaw(
+        () => {
+          const key = JSON.stringify([config.host, config.port, config.secure, config.user]);
+          let transporter = open.get(key);
+          if (!transporter) {
+            // A pool of one keeps the connection open between messages and
+            // opens a new one if the server closes it.
+            transporter = createTransport({
+              ...transportOptions(config),
+              pool: true,
+              maxConnections: 1,
+            }) as Transporter;
+            open.set(key, transporter);
+          }
+          return transporter;
+        },
+        raw,
+        envelope,
+        config
+      ),
+    close() {
+      for (const transporter of open.values()) transporter.close();
+      open.clear();
+    },
+  };
 }

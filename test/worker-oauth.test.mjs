@@ -277,7 +277,10 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
       ["mail_send", "draftId", "gmail:d:me@gmail.com:r-123", "gmail:m:me@gmail.com:18c2a"],
     ]) {
       const schema = listed.result.tools.find((tool) => tool.name === name).inputSchema;
-      const pattern = new RegExp(schema.properties[field].pattern, "u");
+      // An optional ID is nullable: its pattern is in the string branch.
+      const property = schema.properties[field];
+      const source = property.pattern ?? property.anyOf?.find((item) => item.pattern)?.pattern;
+      const pattern = new RegExp(source, "u");
       assert.equal(pattern.exec(sample)?.[0], sample, `${name}: full ID must match`);
       assert.equal(pattern.test(invalid), false, `${name}: invalid ID must be rejected`);
       assert.equal(

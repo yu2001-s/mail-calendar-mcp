@@ -141,4 +141,20 @@ describe("draft MIME composition", () => {
       body: "請問您我的連絡方式是由那位人員提供或連繫",
     });
   });
+
+  it("dates a draft when it is sent, not when it was saved", async () => {
+    const raw = await composeDraftMime({
+      from: "a@example.com",
+      to: ["b@example.com"],
+      subject: "Later",
+      body: "Saved at night, sent in the morning.",
+      draftUuid: "u2",
+      date: new Date("2026-11-04T01:08:00Z"),
+    });
+    const sent = prepareDraftMimeForSend(raw, new Date("2026-11-04T06:18:00Z")).toString();
+    expect(sent.match(/^Date: [^\r\n]*/gim)).toEqual(["Date: Wed, 04 Nov 2026 06:18:00 +0000"]);
+    expect(parseDraftMime(sent).body).toBe("Saved at night, sent in the morning.");
+    // Without a send time the saved date stays.
+    expect(prepareDraftMimeForSend(raw).toString()).toMatch(/^Date: Wed, 04 Nov 2026 01:08:00/m);
+  });
 });

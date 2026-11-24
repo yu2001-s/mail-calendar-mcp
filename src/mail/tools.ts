@@ -8,7 +8,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ImapFlow, MessageStructureObject } from "imapflow";
 import { detectMimeType } from "nodemailer/lib/mime-funcs/mime-types.js";
 import { z } from "zod";
-import type { GoogleAccounts } from "../google/accounts.js";
+import { GoogleApiError, type GoogleAccounts } from "../google/accounts.js";
 import {
   Gmail,
   MAX_ATTACHMENT_BYTES,
@@ -27,8 +27,8 @@ import {
   mergeDiscovered,
   sameAddress,
 } from "../icloud/settings.js";
-import { withSignature } from "../icloud/signature.js";
-import { registerTool, toolResult, type ToolAnnotations } from "../mcp/tooling.js";
+import { signatureFor, withSignature } from "../icloud/signature.js";
+import { nullAsAbsent, registerTool, toolResult, type ToolAnnotations } from "../mcp/tooling.js";
 import {
   uploadRefShape,
   withUploads,
@@ -54,10 +54,10 @@ import {
   type ImapOpResult,
 } from "../services/imapClient.js";
 import type { ImapDraftResult } from "../services/imapDraftManager.js";
-import type { MimeDraftAttachment } from "../services/mimeDraft.js";
+import { splitAddresses, type MimeDraftAttachment } from "../services/mimeDraft.js";
 import { editedContent, FORWARD_INTRO } from "../services/quotedContent.js";
 import { withSubjectPrefix } from "../services/replyForward.js";
-import { resolveSmtpConfig } from "../services/smtpMailer.js";
+import { resolveSmtpConfig, type SmtpSession } from "../services/smtpMailer.js";
 import type { AttachmentInput as InlineAttachment, Draft } from "../types.js";
 import { escapeHtml } from "../utils/escapeHtml.js";
 import { htmlToText } from "../utils/htmlText.js";
@@ -77,13 +77,22 @@ import {
 /** How long discovered sending addresses are trusted before Sent is scanned again. */
 const DISCOVERY_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_BODY_CHARS = 20000;
+/** Most drafts one mail_create_draft or mail_send takes; a batch must finish within a tool call. */
+const MAX_BATCH = 20;
+/** How long after a batch the inbox is checked for bounces that came back at once. */
+const BOUNCE_WAIT_MS = 5000;
+/** Delivery reports read per account, and how much of each. */
+const REPORTS_CHECKED = 20;
+const REPORT_BYTES = 64 * 1024;
+/** Slack between this Worker's clock and the mail server's. */
+const CLOCK_SKEW_MS = 60 * 1000;
 
 /** What the mail tools do; part of the server instructions. */
 export function mailInstructions(primaryAddress?: string): string {
   const sender = primaryAddress
     ? `by default ${primaryAddress} (iCloud, whose inbox also receives custom-domain mail)`
     : "by default the account's own address";
-  return `mail_* tools work alike for the iCloud account and every linked Gmail account. Every ID names its account, so follow-up calls take no account; mail_search, mail_list_drafts and mail_list_folders cover every account unless given accounts. mail_create_draft saves a new message, a reply (replyTo) or a forward (forward); its from address picks the account, ${sender}. mail_update_draft edits a draft, and mail_send sends one with its current revision. Saved signatures are added to drafts. mail_update marks, flags, labels and moves messages. Before saying where a conversation stands, read it with mail_read thread: true, which includes your sent replies, and go by its last message.`;
+  return `mail_* tools work alike for the iCloud account and every linked Gmail account. Every ID names its account, so follow-up calls take no account; mail_search, mail_list_drafts and mail_list_folders cover every account unless given accounts. mail_create_draft saves a new message, a reply (replyTo) or a forward (forward); its from address picks the account, ${sender}. mail_update_draft edits a draft, and mail_send sends one with its current revision. For a batch of different messages, mail_create_draft takes messages and mail_send takes drafts, so a batch is two calls. Saved signatures are added to drafts. mail_update marks, flags, labels and moves messages. Before saying where a conversation stands, read it with mail_read thread: true, which includes your sent replies, and go by its last message.`;
 }
 
 export interface MailServices {
@@ -91,6 +100,8 @@ export interface MailServices {
   google?: GoogleAccounts;
   gmail?: Gmail;
   uploads?: Uploads;
+  /** How long a batch send waits before looking for bounces; tests use 0. */
+  bounceWaitMs?: number;
 }
 
 type Account = { kind: "icloud"; name: string } | { kind: "gmail"; name: string };
@@ -139,6 +150,35 @@ function gmailCategory(labels: string[]): string | undefined {
   if (!id) return undefined;
   const name = id.slice("CATEGORY_".length).toLowerCase();
   return name === "personal" ? "primary" : name;
+}
+
+/** A Message-ID as it appears anywhere: without angle brackets, lowercase. */
+function bareMessageId(value: string): string {
+  return value.trim().replace(/^<|>$/g, "").toLowerCase();
+}
+
+/** Every recipient of a sent row, as bare lowercase addresses. */
+function recipientsOf(row: { to?: string[]; cc?: string[]; bcc?: string[] }): string[] {
+  return [...(row.to ?? []), ...(row.cc ?? []), ...(row.bcc ?? [])].map((value) =>
+    nameAndAddress(value).address.toLowerCase()
+  );
+}
+
+/**
+ * Why a delivery report says the message failed: its Diagnostic-Code, else
+ * the lines that name the recipient.
+ */
+export function bounceReason(text: string, recipients: string[]): string {
+  const unfolded = text.replace(/\r?\n[ \t]+/g, " ");
+  const diagnostic = unfolded.match(/^Diagnostic-Code:[ \t]*(?:[\w-]+;[ \t]*)?(.+)$/im)?.[1];
+  if (diagnostic) return snippetOf(diagnostic, 300);
+  const lines = unfolded.split(/\r?\n/);
+  const at = lines.findIndex(
+    (line) =>
+      !/^(?:to|cc|bcc):/i.test(line) &&
+      recipients.some((address) => line.toLowerCase().includes(address))
+  );
+  return (at < 0 ? "" : snippetOf(lines.slice(at, at + 3).join(" "), 300)) || "Delivery failed.";
 }
 
 /** The start of a body, on one line, as a list shows it. */
@@ -1081,7 +1121,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
 
   // ---------------------------------------------------------------- Drafts and sending
 
-  const composeFields = {
+  const composeFields = () => ({
     to: emails("Recipients, as plain addresses."),
     cc: emails("Cc recipients."),
     bcc: emails("Bcc recipients."),
@@ -1094,46 +1134,94 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
       .string()
       .optional()
       .describe("HTML body; body, if given, is its plain-text alternative."),
-  };
+  });
+
+  /** One draft's fields, alone or as an item of messages. */
+  const draftFields = () => ({
+    from: z
+      .string()
+      .email()
+      .optional()
+      .describe(
+        "Sending address; it picks the account. Default: the primary address, or for a reply or forward the account the original is in."
+      ),
+    ...composeFields(),
+    attachments: attachments(),
+    replyTo: messageId().optional().describe("Message (or Gmail thread) to reply to."),
+    replyAll: z.boolean().optional().describe("Reply to every recipient of the original."),
+    quoteOriginal: z
+      .boolean()
+      .optional()
+      .describe("Quote the original below a reply; default true."),
+    forward: messageId().optional().describe("Message to forward."),
+    includeSignature: includeSignature(),
+  });
 
   tool(
     "mail_create_draft",
-    "Save a draft without sending it: a new message, a reply to replyTo (recipients, subject and threading come from the original), or a forward of forward with its attachments. Returns the saved draft with its revision for mail_send.",
+    `Save a draft without sending it: a new message, a reply to replyTo (recipients, subject and threading come from the original), or a forward of forward with its attachments. Returns the saved draft with its revision for mail_send. For several different messages give messages, up to ${MAX_BATCH}, instead of one message's fields: it returns each draft's ID, revision, recipients and subject (not the bodies you wrote) and the signatures it added, and a draft that fails does not stop the others.`,
     {
-      from: z
-        .string()
-        .email()
+      ...draftFields(),
+      messages: z
+        // Strict hosts send null for unset fields here too.
+        .array(z.object(nullAsAbsent(draftFields())))
+        .min(1)
+        .max(MAX_BATCH)
         .optional()
-        .describe(
-          "Sending address; it picks the account. Default: the primary address, or for a reply or forward the account the original is in."
-        ),
-      ...composeFields,
-      attachments: attachments(),
-      replyTo: messageId().optional().describe("Message (or Gmail thread) to reply to."),
-      replyAll: z.boolean().optional().describe("Reply to every recipient of the original."),
-      quoteOriginal: z
-        .boolean()
-        .optional()
-        .describe("Quote the original below a reply; default true."),
-      forward: messageId().optional().describe("Message to forward."),
-      includeSignature: includeSignature(),
+        .describe("Several drafts, each with the fields of one, saved in this order."),
     },
     "write",
     async (args) => {
-      if (args.replyTo && args.forward) throw new Error("Give replyTo or forward, not both.");
-      const source: string | undefined = args.replyTo ?? args.forward;
-      const account = source ? await accountOf(source) : await senderAccount(args.from);
-      if (source && args.from && !(await sendsAs(account, args.from))) {
-        throw new Error(`${args.from} cannot send from ${account.name}, where the original is.`);
+      if (!args.messages) return createDraft(args);
+      const { messages, ...single } = args;
+      if (Object.values(single).some((value) => value !== undefined)) {
+        throw new Error("Give messages, or one message's fields, not both.");
       }
-      if (!source && !args.to?.length && !args.cc?.length && !args.bcc?.length) {
-        throw new Error("Give at least one recipient.");
+      const drafts: unknown[] = [];
+      const signatures: Record<string, string> = {};
+      for (const [index, message] of (messages as any[]).entries()) {
+        try {
+          // The bodies are what the caller wrote; leaving them out keeps the result short.
+          const draft = await createDraft(message);
+          delete draft.body;
+          delete draft.htmlBody;
+          drafts.push(draft);
+          const from = addressesIn(draft.from)[0];
+          const signature = from && message.includeSignature !== false && signatureOf(from);
+          if (signature) signatures[from] = signature;
+        } catch (error) {
+          drafts.push({ index, error: (error as Error).message });
+        }
       }
-      return account.kind === "icloud"
-        ? createIcloudDraft(args)
-        : createGmailDraft(account.name, args);
+      const failed = drafts.filter((draft: any) => draft.error).length;
+      return {
+        drafts,
+        created: drafts.length - failed,
+        ...(failed && { failed }),
+        ...(Object.keys(signatures).length && { signatures }),
+      };
     }
   );
+
+  async function createDraft(args: any): Promise<any> {
+    if (args.replyTo && args.forward) throw new Error("Give replyTo or forward, not both.");
+    const source: string | undefined = args.replyTo ?? args.forward;
+    const account = source ? await accountOf(source) : await senderAccount(args.from);
+    if (source && args.from && !(await sendsAs(account, args.from))) {
+      throw new Error(`${args.from} cannot send from ${account.name}, where the original is.`);
+    }
+    if (!source && !args.to?.length && !args.cc?.length && !args.bcc?.length) {
+      throw new Error("Give at least one recipient.");
+    }
+    return account.kind === "icloud"
+      ? createIcloudDraft(args)
+      : createGmailDraft(account.name, args);
+  }
+
+  /** The signature saved for an address, as drafts from it get. */
+  function signatureOf(address: string): string | undefined {
+    return signatureFor(icloud?.settings ?? { signatures: {} }, address);
+  }
 
   async function createIcloudDraft(args: any) {
     const ctx = needIcloud();
@@ -1260,7 +1348,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
       draftId: draftId(),
       revision: z.string().min(1).describe("The draft's current revision."),
       from: z.string().email().optional().describe("Another sending address of the same account."),
-      ...composeFields,
+      ...composeFields(),
       attachmentsToAdd: attachments(),
       attachmentNamesToRemove: z.array(z.string()).max(20).optional(),
       includeSignature: includeSignature(),
@@ -1427,35 +1515,264 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
 
   tool(
     "mail_send",
-    "Send a draft exactly as saved, from its own account, and keep a copy in Sent. Needs the draft's current revision. Never resend after an uncertain outcome: check Sent first.",
-    { draftId: draftId(), revision: z.string().min(1).describe("The draft's current revision.") },
+    `Send a draft exactly as saved, from its own account, and keep a copy in Sent. Needs the draft's current revision. Returns the sent message's ID, its Message-ID header and when it went. For several drafts give drafts, up to ${MAX_BATCH}, sent in order over one login: each gets its own result, a draft that is refused does not stop the rest, and the inbox is then checked for bounces that already came back (later ones arrive as mail from mailer-daemon). Never resend after an uncertain outcome: check Sent first.`,
+    {
+      draftId: draftId().optional(),
+      revision: z.string().min(1).optional().describe("The draft's current revision."),
+      drafts: z
+        .array(
+          z.object({
+            draftId: draftId(),
+            revision: z.string().min(1).describe("The draft's current revision."),
+          })
+        )
+        .min(1)
+        .max(MAX_BATCH)
+        .optional()
+        .describe("Several drafts to send, in this order, instead of draftId and revision."),
+    },
     "write",
     async (args) => {
-      const account = await accountOf(args.draftId);
-      if (account.kind === "gmail") {
-        const { draft } = await checkedGmailDraft(args.draftId, args.revision);
-        const sent = await needGmail().gmail.sendMessage(account.name, { draftId: draft });
-        return {
-          sent: true,
-          account: account.name,
-          id: gmailId("message", account.name, sent.id),
-          threadId: gmailId("thread", account.name, sent.threadId),
-          viewUrl: sent.viewUrl,
-        };
+      if (args.drafts) {
+        if (args.draftId || args.revision) {
+          throw new Error("Give drafts, or one draftId and revision, not both.");
+        }
+        return sendBatch(args.drafts);
       }
-      const drafts = needIcloud().drafts;
-      const result = args.draftId.startsWith("apple-draft:")
-        ? await drafts.sendDraft(args.draftId, args.revision)
-        : await drafts.sendImapDraft(args.draftId, args.revision);
-      if (!result.success) throw new Error(result.error ?? "The draft was not sent.");
-      return {
-        sent: true,
-        account: account.name,
-        ...(result.sentMessageId && { id: result.sentMessageId }),
-        ...(result.warning && { warning: result.warning }),
-      };
+      if (!args.draftId || !args.revision) throw new Error("Give draftId and revision, or drafts.");
+      return sendOne(args.draftId, args.revision);
     }
   );
+
+  /** A send that failed; `uncertain` when the message may still have gone. */
+  class SendFailure extends Error {
+    constructor(
+      message: string,
+      readonly uncertain = false
+    ) {
+      super(message);
+    }
+  }
+
+  interface SentRow {
+    draftId: string;
+    sent: true;
+    account: string;
+    id?: string;
+    threadId?: string;
+    viewUrl?: string;
+    messageId?: string;
+    sentAt?: string;
+    to?: string[];
+    cc?: string[];
+    bcc?: string[];
+    subject?: string;
+    warning?: string;
+    bounced?: { id: string; reason: string };
+  }
+
+  async function sendOne(id: string, revision: string, smtp?: SmtpSession): Promise<SentRow> {
+    const account = await accountOf(id);
+    if (account.kind === "gmail") {
+      const { gmail } = needGmail();
+      const { draft } = await checkedGmailDraft(id, revision);
+      let sent;
+      try {
+        sent = await gmail.sendMessage(account.name, { draftId: draft });
+      } catch (error) {
+        // Gmail answered with an error, or the request may have reached it.
+        throw new SendFailure((error as Error).message, !(error instanceof GoogleApiError));
+      }
+      // What was sent, for the record; the message is out either way.
+      const { headers, date } = await gmail
+        .messageHeaders(account.name, sent.id, ["Message-ID", "To", "Cc", "Bcc", "Subject"])
+        .catch(() => ({ headers: {} as Record<string, string>, date: undefined }));
+      const list = (name: string) => displayAddresses(splitAddresses(headers[name] ?? null));
+      return {
+        draftId: id,
+        sent: true,
+        account: account.name,
+        id: gmailId("message", account.name, sent.id),
+        threadId: gmailId("thread", account.name, sent.threadId),
+        viewUrl: sent.viewUrl,
+        ...(headers["Message-ID"] && { messageId: headers["Message-ID"] }),
+        ...(date && { sentAt: date }),
+        ...(headers.To && { to: list("To") }),
+        ...(headers.Cc && { cc: list("Cc") }),
+        ...(headers.Bcc && { bcc: list("Bcc") }),
+        ...(headers.Subject !== undefined && { subject: headers.Subject }),
+      };
+    }
+    const drafts = needIcloud().drafts;
+    const result = id.startsWith("apple-draft:")
+      ? await drafts.sendDraft(id, revision, smtp?.send)
+      : await drafts.sendImapDraft(id, revision, smtp?.send);
+    if (!result.success) {
+      throw new SendFailure(result.error ?? "The draft was not sent.", result.uncertain);
+    }
+    const draft = result.draft;
+    return {
+      draftId: id,
+      sent: true,
+      account: needIcloud().account,
+      ...(result.sentMessageId && { id: result.sentMessageId }),
+      ...(result.messageId && { messageId: result.messageId }),
+      ...(result.sentAt && { sentAt: result.sentAt }),
+      ...(draft && { to: displayAddresses(draft.to) }),
+      ...(draft?.cc.length && { cc: displayAddresses(draft.cc) }),
+      ...(draft?.bcc.length && { bcc: displayAddresses(draft.bcc) }),
+      ...(draft && { subject: draft.subject }),
+      ...(result.warning && { warning: result.warning }),
+    };
+  }
+
+  /** How long after a batch the inbox is checked for bounces. */
+  const bounceWaitMs = services.bounceWaitMs ?? BOUNCE_WAIT_MS;
+
+  /** A delivery report: a bounce, or a delay notice. */
+  interface Report {
+    id: string;
+    text: string;
+  }
+
+  /**
+   * Mark each sent row whose bounce is already in its account's inbox: a
+   * delivery report since the batch began that names the row's Message-ID
+   * or, if it names none, one of its recipients. Returns what failed.
+   */
+  async function markBounces(rows: SentRow[], since: number): Promise<string | undefined> {
+    const errors: string[] = [];
+    for (const account of new Set(rows.map((row) => row.account))) {
+      const own = rows.filter((row) => row.account === account);
+      try {
+        const reports =
+          account === icloud?.account
+            ? await icloudReports(since)
+            : await gmailReports(account, since);
+        for (const report of reports) {
+          const text = report.text.toLowerCase();
+          const byId = own.filter(
+            (row) => row.messageId && text.includes(bareMessageId(row.messageId))
+          );
+          const matched = byId.length
+            ? byId
+            : own.filter((row) => recipientsOf(row).some((address) => text.includes(address)));
+          for (const row of matched) {
+            row.bounced ??= { id: report.id, reason: bounceReason(report.text, recipientsOf(row)) };
+          }
+        }
+      } catch (error) {
+        errors.push(`${account}: ${(error as Error).message}`);
+      }
+    }
+    return errors.length ? errors.join(" ") : undefined;
+  }
+
+  async function icloudReports(since: number): Promise<Report[]> {
+    const ctx = needIcloud();
+    return ctx.withImap(async (client) => {
+      const lock = await client.getMailboxLock("INBOX");
+      try {
+        // SINCE is a date, not a time: the day before covers every time zone.
+        const found = await client.search(
+          {
+            since: new Date(since - 24 * 60 * 60 * 1000),
+            or: [{ from: "mailer-daemon" }, { from: "postmaster" }],
+          },
+          { uid: true }
+        );
+        const uids = (Array.isArray(found) ? found : []).slice(-REPORTS_CHECKED);
+        const reports: Report[] = [];
+        if (!uids.length) return reports;
+        for await (const message of client.fetch(
+          uids.join(","),
+          { internalDate: true, source: { maxLength: REPORT_BYTES } },
+          { uid: true }
+        )) {
+          const at = message.internalDate ? new Date(message.internalDate).getTime() : Date.now();
+          if (at < since - CLOCK_SKEW_MS || !message.source) continue;
+          reports.push({
+            id: encodeImapId(ctx.account, "INBOX", message.uid),
+            text: Buffer.from(message.source).toString("utf8"),
+          });
+        }
+        return reports;
+      } finally {
+        lock.release();
+      }
+    });
+  }
+
+  async function gmailReports(account: string, since: number): Promise<Report[]> {
+    const { gmail } = needGmail();
+    const after = Math.floor((since - CLOCK_SKEW_MS) / 1000);
+    const list = await gmail.searchMessages(account, {
+      query: `from:(mailer-daemon OR postmaster) after:${after}`,
+      pageSize: REPORTS_CHECKED,
+    });
+    const reports: Report[] = [];
+    for (const message of list.messages as Array<{ id: string; error?: string }>) {
+      if (message.error) continue;
+      const view = await gmail.getMessage(account, message.id, "RAW", REPORT_BYTES);
+      reports.push({
+        id: gmailId("message", account, message.id),
+        text: String((view as { raw?: string }).raw ?? ""),
+      });
+    }
+    return reports;
+  }
+
+  async function sendBatch(items: Array<{ draftId: string; revision: string }>) {
+    const ids = items.map((item) => item.draftId);
+    const repeated = ids.find((id, index) => ids.indexOf(id) !== index);
+    if (repeated) throw new Error(`${repeated} is in drafts twice.`);
+    const started = Date.now();
+    const smtp = icloud?.drafts.openSmtpSession();
+    const results: Array<SentRow | Record<string, unknown>> = [];
+    let stoppedBy: string | undefined;
+    try {
+      for (const item of items) {
+        if (stoppedBy) {
+          results.push({
+            draftId: item.draftId,
+            sent: false,
+            notAttempted: `Not sent, because the outcome of ${stoppedBy} is uncertain. Check Sent for it, then send the rest.`,
+          });
+          continue;
+        }
+        try {
+          results.push(await sendOne(item.draftId, item.revision, smtp));
+        } catch (error) {
+          const uncertain = error instanceof SendFailure && error.uncertain;
+          results.push({
+            draftId: item.draftId,
+            sent: false,
+            error: (error as Error).message,
+            ...(uncertain && { uncertain }),
+          });
+          if (uncertain) stoppedBy = item.draftId;
+        }
+      }
+    } finally {
+      smtp?.close();
+    }
+    const sent = results.filter((row): row is SentRow => row.sent === true);
+    let bounceError: string | undefined;
+    if (sent.length) {
+      // Most rejections come back within seconds of the send.
+      await new Promise((resolve) => setTimeout(resolve, bounceWaitMs));
+      bounceError = await markBounces(sent, started);
+    }
+    return {
+      results,
+      sent: sent.length,
+      ...(results.length > sent.length && { notSent: results.length - sent.length }),
+      ...(sent.length && {
+        bounced: sent.filter((row) => row.bounced).length,
+        ...(bounceError && { bounceCheckError: bounceError }),
+      }),
+    };
+  }
 
   // ---------------------------------------------------------------- Organizing
 

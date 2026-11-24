@@ -193,14 +193,18 @@ export function draftMimeRevision(raw: Buffer | string): string {
 }
 
 /**
- * Remove headers that belong in a stored draft but must never be delivered.
- * MIME body bytes are otherwise unchanged, so the reviewed revision is exact.
+ * The message a draft goes out as: headers that belong in a stored draft but
+ * must never be delivered removed, and, given `sentAt`, dated when it is sent
+ * rather than when it was saved, so it does not sort below mail that arrived
+ * in between. MIME body bytes are unchanged, so the reviewed revision is exact.
  */
-export function prepareDraftMimeForSend(raw: Buffer | string): Buffer {
+export function prepareDraftMimeForSend(raw: Buffer | string, sentAt?: Date): Buffer {
   const source = Buffer.isBuffer(raw) ? raw.toString("utf8") : raw;
   const { headers, body } = splitHeaderBody(source);
   const lines = headers.split(/\r?\n/);
   const kept: string[] = [];
+  const date = sentAt && `Date: ${rfc5322Date(sentAt)}`;
+  let dated = false;
   let skip = false;
   for (const line of lines) {
     if (/^[ \t]/.test(line)) {
@@ -208,9 +212,20 @@ export function prepareDraftMimeForSend(raw: Buffer | string): Buffer {
       continue;
     }
     skip = /^(?:bcc|x-apple-mail-plugin-draft-id):/i.test(line);
+    if (date && /^date:/i.test(line)) {
+      skip = true;
+      if (!dated) kept.push(date);
+      dated = true;
+    }
     if (!skip) kept.push(line);
   }
+  if (date && !dated) kept.unshift(date);
   return Buffer.from(`${kept.join("\r\n")}\r\n\r\n${body.replace(/\r?\n/g, "\r\n")}`, "utf8");
+}
+
+/** An RFC 5322 date in UTC, as nodemailer writes one. */
+function rfc5322Date(date: Date): string {
+  return date.toUTCString().replace(/GMT$/, "+0000");
 }
 
 export function mimeAttachmentsForResource(parsed: ParsedDraftMime, draftId: string): Attachment[] {
