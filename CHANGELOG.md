@@ -12,10 +12,14 @@
   subject, without the bodies, plus the signatures it added. `mail_send`
   takes `drafts`, up to 20, sent in order over one SMTP connection: each
   gets its own result, a refusal does not stop the rest, and an uncertain
-  outcome stops the batch so nothing after it can go twice. Five seconds
-  after the last one, the inbox of each account is checked for delivery
-  reports naming a sent message's Message-ID or recipient, and those rows
-  are marked `bounced` with the reason.
+  outcome stops the batch so nothing after it can go twice. Ten seconds
+  after the last send starts, the inbox of each account is checked for
+  delivery reports naming a sent message's Message-ID or recipient, and
+  those rows are marked `bounced` with the reason; `bouncesCheckedAt` says
+  when. Measured in the Worker, SMTP took 590 ms for the first message of a
+  batch and 140 ms for each after it on the same connection, and a send
+  1.3 s in all; iCloud bounces reached the inbox 3 to 14 s after the send,
+  which 2.0.4's check after 5 s missed for the last message.
 - **`mail_send` says what went and when.** Each sent message comes back with
   its Message-ID header, the time it went, its recipients and subject, from
   iCloud and Gmail alike.
