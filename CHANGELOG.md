@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Upload and download links work through the mcp-hub.** A call through
+  the `AgentMcp` service binding came in on `https://agent.internal`, and
+  `create_attachment_upload` and `mail_get_attachment` built their links on
+  it, so `curl` failed with "Could not resolve host" and the agent had to dig
+  the Worker URL out of the docs. Links are now built only on the Worker's
+  public origin: `ICLOUD_MAIL_PUBLIC_URL`, or the host a public request came
+  in on. Without `ICLOUD_MAIL_PUBLIC_URL`, a binding call gets no link tools
+  rather than dead links; `scripts/setup-worker.mjs` sets it on deploy.
+- **Non-ASCII attachment names read back as written.** A draft attachment
+  named `Poieti_產品介紹.pdf` came back from `mail_read` and
+  `mail_list_drafts` as `=?UTF-8?Q?Poieti=5F=E7=94=A2…?=`, and
+  `mail_update_draft` saved the kept attachment under that literal name, so
+  the recipient would have seen it. RFC 2231 names (`filename*0*=utf-8''…`,
+  which nodemailer writes) and RFC 2047 encoded-words are now decoded.
+
 - **A batch of different messages is two calls.** Sending six outreach
   letters took twelve calls: a draft for each, which answered with its whole
   body, then a send for each, with its revision copied over, each logging in

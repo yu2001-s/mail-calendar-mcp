@@ -74,6 +74,9 @@ without sending.
 The Worker URL is `https://icloud-mail.<your-subdomain>.workers.dev`; a custom
 domain can be added in the Cloudflare dashboard. If it answers on more than one
 hostname, set `ICLOUD_MAIL_PUBLIC_URL` so tokens are bound to one origin.
+`scripts/setup-worker.mjs` sets it to the workers.dev URL on its first deploy:
+links in tool results (attachment uploads and downloads, `/accounts`) are built
+on it, and a call through a service binding has no other way to learn it.
 
 ## Connect
 
@@ -95,7 +98,9 @@ that asks for the owner password.
   the named entrypoint `AgentMcp` (`{"service": "icloud-mail", "entrypoint":
   "AgentMcp"}`) and send MCP to `/mcp` on any hostname. It serves what an
   approved owner connection gets, without OAuth: a named entrypoint is reached
-  only through a service binding, never from the internet.
+  only through a service binding, never from the internet. Without
+  `ICLOUD_MAIL_PUBLIC_URL` it offers no tools that hand out links, since the
+  hostname it is called on is not one anybody can open.
 
 After changing tool parameters, deploy the Worker, then open the existing
 iCloud Mail plugin in ChatGPT, choose **Manage**, and select **Refresh tools**.

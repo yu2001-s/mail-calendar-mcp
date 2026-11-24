@@ -23,6 +23,7 @@ import { CONNECTOR_TITLE } from "../mcp/identity.js";
 import { homePage, privacyPage } from "./pages.js";
 import { handleDownload, handleUpload, type R2 } from "./uploads.js";
 import { OWNER_USER_ID, stampGrantId, withGrantHeader } from "./grants.js";
+import { PUBLIC_ORIGIN_HEADER } from "./session.js";
 import {
   consentFormAction,
   failures,
@@ -75,7 +76,7 @@ const mcpHandler = {
   async fetch(
     request: Request,
     env: Env,
-    ctx: { props?: { grantId?: string } }
+    ctx: { props?: { grantId?: string }; viaBinding?: boolean }
   ): Promise<Response> {
     if (request.method !== "POST") {
       return Response.json(
@@ -100,7 +101,11 @@ const mcpHandler = {
     const session = env.MAIL_SESSION.get(env.MAIL_SESSION.idFromName("icloud"), {
       locationHint: "enam",
     });
-    return session.fetch(withGrantHeader(request, ctx.props?.grantId));
+    const forwarded = withGrantHeader(request, ctx.props?.grantId);
+    forwarded.headers.delete(PUBLIC_ORIGIN_HEADER);
+    const origin = publicOrigin(env, ctx.viaBinding ? undefined : request);
+    if (origin) forwarded.headers.set(PUBLIC_ORIGIN_HEADER, origin);
+    return session.fetch(forwarded);
   },
 };
 
@@ -186,6 +191,19 @@ const appHandler = {
   },
 };
 
+/**
+ * The origin the internet reaches this Worker at, which links in tool results
+ * (uploads, downloads, /accounts) are built on: ICLOUD_MAIL_PUBLIC_URL, else the
+ * one a public request came in on. A request through a service binding names
+ * no real host (the mcp-hub sends https://agent.internal/mcp), so without
+ * ICLOUD_MAIL_PUBLIC_URL it has none, and the tools that hand out links are
+ * left out rather than handing out links nobody can open.
+ */
+function publicOrigin(env: Env, request?: Request): string | undefined {
+  const url = env.ICLOUD_MAIL_PUBLIC_URL || request?.url;
+  return url ? new URL(url).origin : undefined;
+}
+
 /** The API route as the OAuth library matches it: /mcp and the paths below it. */
 function isMcpPath(pathname: string): boolean {
   return pathname === "/mcp" || pathname.startsWith("/mcp/");
@@ -209,7 +227,7 @@ export class AgentMcp extends WorkerEntrypoint<Env> {
     if (!isMcpPath(new URL(request.url).pathname)) {
       return new Response("Not found", { status: 404 });
     }
-    return mcpHandler.fetch(request, this.env, { props: OWNER_PROPS });
+    return mcpHandler.fetch(request, this.env, { props: OWNER_PROPS, viaBinding: true });
   }
 }
 

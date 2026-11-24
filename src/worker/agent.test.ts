@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { AgentMcp, type Env } from "@/worker/index.js";
+import { PUBLIC_ORIGIN_HEADER } from "@/worker/session.js";
 
 /** An AgentMcp whose MailSession records the requests it receives. */
-function entrypoint() {
+function entrypoint(vars: Partial<Env> = {}) {
   const received: Request[] = [];
   const named: string[] = [];
   const env = {
     ICLOUD_MAIL_PREFERENCES: "{}",
+    ...vars,
     MAIL_SESSION: {
       idFromName(name: string) {
         named.push(name);
@@ -67,6 +69,26 @@ describe("AgentMcp", () => {
     spoofed.headers.set("x-mail-oauth-grant", "someone-elses-grant");
     await agent.fetch(spoofed);
     expect(received[0].headers.has("x-mail-oauth-grant")).toBe(false);
+  });
+
+  it("builds links on ICLOUD_MAIL_PUBLIC_URL, never on the binding's made-up host", async () => {
+    const { agent, received } = entrypoint({
+      ICLOUD_MAIL_PUBLIC_URL: "https://icloud-mail.example.workers.dev/",
+    });
+    const spoofed = call("/mcp");
+    spoofed.headers.set(PUBLIC_ORIGIN_HEADER, "https://attacker.example");
+    await agent.fetch(spoofed);
+    expect(received[0].headers.get(PUBLIC_ORIGIN_HEADER)).toBe(
+      "https://icloud-mail.example.workers.dev"
+    );
+  });
+
+  it("names no origin without ICLOUD_MAIL_PUBLIC_URL, so no tool hands out links", async () => {
+    const { agent, received } = entrypoint();
+    const spoofed = call("/mcp");
+    spoofed.headers.set(PUBLIC_ORIGIN_HEADER, "https://agent.internal");
+    await agent.fetch(spoofed);
+    expect(received[0].headers.has(PUBLIC_ORIGIN_HEADER)).toBe(false);
   });
 
   it("answers like the public /mcp to other methods", async () => {

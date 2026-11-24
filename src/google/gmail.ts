@@ -5,7 +5,8 @@
  */
 import nodemailer from "nodemailer";
 import type { GoogleAccounts } from "./accounts.js";
-import { decodeHeaderWord, parseDraftMime, splitAddresses } from "../services/mimeDraft.js";
+import { parseDraftMime, splitAddresses } from "../services/mimeDraft.js";
+import { decodeHeaderWord } from "../utils/mimeParse.js";
 import { editedContent, FORWARD_INTRO } from "../services/quotedContent.js";
 import {
   buildReplyOptions,
