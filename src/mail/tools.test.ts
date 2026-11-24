@@ -310,6 +310,26 @@ describe("mail tools", () => {
   let uploads: Uploads & { share: ReturnType<typeof vi.fn> };
   let call: (name: string, args?: Record<string, unknown>) => Promise<any>;
 
+  /** A client of mail tools that wait `bounceWaitMs` before looking for bounces. */
+  async function connect(bounceWaitMs: number) {
+    const server = new McpServer({ name: "test", version: "1" });
+    registerMailTools(server, {
+      icloud: icloud.icloud,
+      google: gmail.google,
+      uploads,
+      bounceWaitMs,
+    });
+    const client = new Client({ name: "test", version: "1" });
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(a), client.connect(b)]);
+    return async (name: string, args: Record<string, unknown> = {}) => {
+      const result = await client.callTool({ name, arguments: args });
+      const text = (result.content as Array<{ text: string }>)[0].text;
+      if (result.isError) throw new Error(text);
+      return JSON.parse(text);
+    };
+  }
+
   beforeEach(async () => {
     gmail = fakeGoogle();
     icloud = fakeIcloud();
@@ -322,22 +342,7 @@ describe("mail tools", () => {
         expiresAt: "2026-11-04T00:15:00.000Z",
       })),
     };
-    const server = new McpServer({ name: "test", version: "1" });
-    registerMailTools(server, {
-      icloud: icloud.icloud,
-      google: gmail.google,
-      uploads,
-      bounceWaitMs: 0,
-    });
-    const client = new Client({ name: "test", version: "1" });
-    const [a, b] = InMemoryTransport.createLinkedPair();
-    await Promise.all([server.connect(a), client.connect(b)]);
-    call = async (name, args = {}) => {
-      const result = await client.callTool({ name, arguments: args });
-      const text = (result.content as Array<{ text: string }>)[0].text;
-      if (result.isError) throw new Error(text);
-      return JSON.parse(text);
-    };
+    call = await connect(0);
   });
 
   it("searches every account at once, newest first, with IDs that name their account", async () => {
@@ -662,5 +667,27 @@ describe("mail tools", () => {
       })
     ).rejects.toThrow(/twice/);
     await expect(call("mail_send", { draftId: "apple-draft:amy" })).rejects.toThrow(/revision/);
+  });
+
+  it("waits after the last send, so a bounce that comes back after it is found", async () => {
+    const late = await connect(80);
+    const sentAt = Date.now();
+    // The report reaches the inbox a moment after the batch's last send.
+    setTimeout(
+      () =>
+        icloud.reports.set(
+          11,
+          "From: MAILER-DAEMON\r\n\r\n<nobody@gone.example>: 550 5.1.1 User unknown\r\n"
+        ),
+      20
+    );
+    const result = await late("mail_send", {
+      drafts: [{ draftId: "apple-draft:bad", revision: "r1" }],
+    });
+    expect(result.results[0].bounced).toEqual({
+      id: encodeImapId("iCloud", "INBOX", 11),
+      reason: "<nobody@gone.example>: 550 5.1.1 User unknown",
+    });
+    expect(Date.parse(result.bouncesCheckedAt)).toBeGreaterThanOrEqual(sentAt + 80);
   });
 });

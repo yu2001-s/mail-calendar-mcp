@@ -79,8 +79,12 @@ const DISCOVERY_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_BODY_CHARS = 20000;
 /** Most drafts one mail_create_draft or mail_send takes; a batch must finish within a tool call. */
 const MAX_BATCH = 20;
-/** How long after a batch the inbox is checked for bounces that came back at once. */
-const BOUNCE_WAIT_MS = 5000;
+/**
+ * How long after the last send of a batch starts its inbox is checked for
+ * bounces. Measured from iCloud, a bounce reached the inbox 3 to 14 s after
+ * its send; a check 6 s after missed one.
+ */
+const BOUNCE_WAIT_MS = 10000;
 /** Delivery reports read per account, and how much of each. */
 const REPORTS_CHECKED = 20;
 const REPORT_BYTES = 64 * 1024;
@@ -1515,7 +1519,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
 
   tool(
     "mail_send",
-    `Send a draft exactly as saved, from its own account, and keep a copy in Sent. Needs the draft's current revision. Returns the sent message's ID, its Message-ID header and when it went. For several drafts give drafts, up to ${MAX_BATCH}, sent in order over one login: each gets its own result, a draft that is refused does not stop the rest, and the inbox is then checked for bounces that already came back (later ones arrive as mail from mailer-daemon). Never resend after an uncertain outcome: check Sent first.`,
+    `Send a draft exactly as saved, from its own account, and keep a copy in Sent. Needs the draft's current revision. Returns the sent message's ID, its Message-ID header and when it went. For several drafts give drafts, up to ${MAX_BATCH}, sent in order over one login: each gets its own result, a draft that is refused does not stop the rest, and 10 s after the last send the inbox is checked for bounces (bouncesCheckedAt; later ones arrive as mail from mailer-daemon). Never resend after an uncertain outcome: check Sent first.`,
     {
       draftId: draftId().optional(),
       revision: z.string().min(1).optional().describe("The draft's current revision."),
@@ -1626,7 +1630,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
     };
   }
 
-  /** How long after a batch the inbox is checked for bounces. */
+  /** How long after a batch's last send starts the inbox is checked for bounces. */
   const bounceWaitMs = services.bounceWaitMs ?? BOUNCE_WAIT_MS;
 
   /** A delivery report: a bounce, or a delay notice. */
@@ -1730,6 +1734,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
     const smtp = icloud?.drafts.openSmtpSession();
     const results: Array<SentRow | Record<string, unknown>> = [];
     let stoppedBy: string | undefined;
+    let lastSend = started;
     try {
       for (const item of items) {
         if (stoppedBy) {
@@ -1741,6 +1746,7 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
           continue;
         }
         try {
+          lastSend = Date.now();
           results.push(await sendOne(item.draftId, item.revision, smtp));
         } catch (error) {
           const uncertain = error instanceof SendFailure && error.uncertain;
@@ -1758,9 +1764,12 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
     }
     const sent = results.filter((row): row is SentRow => row.sent === true);
     let bounceError: string | undefined;
+    let checkedAt: string | undefined;
     if (sent.length) {
       // Most rejections come back within seconds of the send.
-      await new Promise((resolve) => setTimeout(resolve, bounceWaitMs));
+      const wait = lastSend + bounceWaitMs - Date.now();
+      if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+      checkedAt = new Date().toISOString();
       bounceError = await markBounces(sent, started);
     }
     return {
@@ -1769,6 +1778,8 @@ export function registerMailTools(server: McpServer, services: MailServices): vo
       ...(results.length > sent.length && { notSent: results.length - sent.length }),
       ...(sent.length && {
         bounced: sent.filter((row) => row.bounced).length,
+        // Bounces after this arrive as mail from mailer-daemon.
+        bouncesCheckedAt: checkedAt,
         ...(bounceError && { bounceCheckError: bounceError }),
       }),
     };
