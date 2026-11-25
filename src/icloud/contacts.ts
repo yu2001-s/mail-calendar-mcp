@@ -86,7 +86,8 @@ export class ICloudContacts {
   #queue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly options: ContactsOptions) {
-    this.#fetch = options.fetch ?? fetch;
+    // Called bare, the Workers runtime refuses fetch with another this ("Illegal invocation").
+    this.#fetch = options.fetch ?? ((input, init) => fetch(input, init));
   }
 
   sync(contacts: ContactInput[]): Promise<SyncResult> {
