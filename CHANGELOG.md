@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **iCloud Contacts show the people directory (`contacts_sync`).** The
+  iPhone showed a bare number when someone in comms' directory called, since
+  no phone number reached its Contacts. `contacts_sync` takes the whole
+  directory and keeps one card per person (name, organisation, phone numbers
+  with extensions, addresses) in the group "comms" over CardDAV, signed in
+  with the iCloud IMAP login and app-specific password. Card UIDs come from
+  the directory's ids, ETags kept in KV let a sync skip cards nobody changed,
+  a card edited on the phone is rewritten, people left out are deleted, and
+  contacts the owner made are never touched. Up to 200 cards are written per
+  call; `pending` says how many wait for the next.
 - **Upload and download links work through the mcp-hub.** A call through
   the `AgentMcp` service binding came in on `https://agent.internal`, and
   `create_attachment_upload` and `mail_get_attachment` built their links on
