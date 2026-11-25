@@ -47,8 +47,9 @@ address picks the account it is sent from.
 iPhone shows who is calling: given everyone in it, it keeps one card per
 person in the group "comms", rewrites the cards that changed and deletes those
 of people left out. comms calls it with everyone in its people directory who
-has a phone number. The cards are the directory's (an edit on the phone is
-overwritten); contacts the owner made are never read or touched. It signs in
+has a phone number. The cards are the directory's (edits to fields on the phone are rewritten,
+while extra `NOTE` text added on the phone is preserved); contacts the owner
+made are never read or touched. It signs in
 to CardDAV with the iCloud IMAP login and app-specific password, and keeps each
 card's ETag in KV so a sync writes only what changed (`src/icloud/contacts.ts`).
 

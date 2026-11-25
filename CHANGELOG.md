@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **iCloud Contacts sync preserves phone-added notes.** When a card's ETag
+  changed on the phone since the last sync, `contacts_sync` now fetches that
+  card's live vCard and preserves any extra `NOTE` text the owner added below
+  the directory's note (separated by `---`) across later syncs and directory
+  updates, while unchanged cards still skip without extra reads.
 - **iCloud Contacts show the people directory (`contacts_sync`).** The
   iPhone showed a bare number when someone in comms' directory called, since
   no phone number reached its Contacts. `contacts_sync` takes the whole

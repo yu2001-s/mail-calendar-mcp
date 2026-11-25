@@ -4,12 +4,13 @@
  * number) into cards of one group, "comms".
  *
  * The cards are the directory's: each sync makes them match the list it is
- * given, overwriting a card edited on the phone and deleting the cards of
- * people no longer in the list. Contacts the owner made are never read or
- * touched. A card's UID comes from the directory id, so syncing the same
- * person twice, even concurrently or after the stored state is lost, writes
- * the same card. The state kept in KV (each card's ETag and the hash of what
- * was written) lets a sync skip the cards nobody changed.
+ * given, rewriting a card edited on the phone (while preserving extra NOTE text
+ * the owner added on the phone) and deleting the cards of people no longer in
+ * the list. Contacts the owner made are never read or touched. A card's UID
+ * comes from the directory id, so syncing the same person twice, even
+ * concurrently or after the stored state is lost, writes the same card. The
+ * state kept in KV (each card's ETag and the hash of what was written) lets a
+ * sync skip the cards nobody changed.
  */
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -52,12 +53,21 @@ export interface SyncResult {
   pending: number;
 }
 
+const PHONE_NOTE_SEP = "\n---\n";
+const MAX_PHONE_NOTE = 4000;
+
 interface SyncedCard {
   uid: string;
   /** The card's URL path in the address book. */
   path: string;
   etag?: string;
   hash: string;
+  /** The directory's note as last written, so phone-added lines can be separated from it. */
+  directoryNote?: string;
+  /** Extra note text the owner added on the phone, preserved across syncs. */
+  phoneNote?: string;
+  /** The full NOTE value last written to iCloud. */
+  writtenNote?: string;
 }
 
 interface SyncState {
@@ -141,9 +151,46 @@ export class ICloudContacts {
       };
 
       for (const contact of contacts) {
-        const uid = state.cards[contact.id]?.uid ?? (await uidFor(contact.id));
-        const card = await write(state.cards[contact.id], uid, vcard(uid, contact));
-        if (card) state.cards[contact.id] = card;
+        const previous = state.cards[contact.id];
+        const uid = previous?.uid ?? (await uidFor(contact.id));
+        const path = previous?.path ?? new URL(`${uid}.vcf`, book).pathname;
+        const etag = live.get(path);
+        const directoryNote = contact.note?.trim() || undefined;
+        let phoneNote = previous?.phoneNote;
+        let effectiveNote = mergeNote(directoryNote, phoneNote);
+        let text = vcard(uid, { ...contact, note: effectiveNote });
+        let hash = await sha256(text);
+        if (previous && etag && previous.etag === etag && previous.hash === hash) {
+          result.unchanged++;
+          continue;
+        }
+        if (writes >= MAX_WRITES) {
+          result.pending++;
+          continue;
+        }
+        // Only fetch the live card when its ETag changed since we last wrote it (edited on the phone).
+        if (previous && etag && previous.etag && previous.etag !== etag) {
+          const liveText = await this.#get(new URL(path, book).href);
+          if (liveText !== undefined) {
+            phoneNote = extractPhoneNote(extractVcardNote(liveText), previous, directoryNote);
+            effectiveNote = mergeNote(directoryNote, phoneNote);
+            text = vcard(uid, { ...contact, note: effectiveNote });
+            hash = await sha256(text);
+          }
+        }
+        writes++;
+        const written = await this.#put(new URL(path, book).href, text);
+        if (etag) result.updated++;
+        else result.created++;
+        state.cards[contact.id] = {
+          uid,
+          path,
+          hash,
+          ...(written && { etag: written }),
+          ...(directoryNote && { directoryNote }),
+          ...(phoneNote && { phoneNote }),
+          ...(effectiveNote && { writtenNote: effectiveNote }),
+        };
       }
       for (const [id, card] of Object.entries(state.cards)) {
         if (ids.has(id)) continue;
@@ -213,6 +260,12 @@ export class ICloudContacts {
       if (etag) etags.set(new URL(r.href, listing.url).pathname, etag);
     }
     return etags;
+  }
+
+  async #get(url: string): Promise<string | undefined> {
+    const { response } = await this.#request("GET", url, { allow: [404] });
+    if (response.status === 404) return undefined;
+    return response.text();
   }
 
   async #put(url: string, text: string): Promise<string | undefined> {
@@ -401,6 +454,66 @@ function escape(text: string): string {
     .replace(/;/g, "\\;");
 }
 
+function unescape(text: string): string {
+  return text.replace(/\\(.)/g, (_, ch: string) => (ch === "n" || ch === "N" ? "\n" : ch));
+}
+
+/** Reads the NOTE value from a vCard (unfolding folded lines and decoding escapes). */
+export function extractVcardNote(text: string): string | undefined {
+  const unfolded = text.replace(/\r?\n[ \t]/g, "");
+  for (const line of unfolded.split(/\r?\n/)) {
+    const match = /^(?:[\w-]+\.)?NOTE(?:;[^:]*)?:(.*)$/i.exec(line);
+    if (!match) continue;
+    const value = unescape(match[1]).trim();
+    return value || undefined;
+  }
+  return undefined;
+}
+
+/** Joins the directory's note with extra text the owner added on the phone. */
+export function mergeNote(
+  directoryNote: string | undefined,
+  phoneNote: string | undefined
+): string | undefined {
+  const dir = directoryNote?.trim() || undefined;
+  const phone = phoneNote?.trim().slice(0, MAX_PHONE_NOTE) || undefined;
+  if (dir && phone) return `${dir}${PHONE_NOTE_SEP}${phone}`;
+  return dir ?? phone;
+}
+
+/**
+ * Separates text the owner added to a card's NOTE on the phone from the directory's
+ * own note, so a later sync keeps the phone memo without duplicating the directory note.
+ */
+export function extractPhoneNote(
+  liveNote: string | undefined,
+  previous: Pick<SyncedCard, "directoryNote" | "phoneNote" | "writtenNote"> | undefined,
+  fallbackDirectoryNote: string | undefined
+): string | undefined {
+  const live = liveNote?.trim() || undefined;
+  if (previous?.writtenNote !== undefined && live === (previous.writtenNote.trim() || undefined)) {
+    return previous.phoneNote;
+  }
+  if (!live) return undefined;
+  const baseDir = (previous?.directoryNote ?? fallbackDirectoryNote)?.trim() || undefined;
+  if (!baseDir) return live.slice(0, MAX_PHONE_NOTE);
+  if (live === baseDir) return undefined;
+  const idx = live.indexOf(baseDir);
+  if (idx !== -1) {
+    const before = live
+      .slice(0, idx)
+      .replace(/(?:\r?\n)*---(?:\r?\n)*$/, "")
+      .trim();
+    const after = live
+      .slice(idx + baseDir.length)
+      .replace(/^(?:\r?\n)*---(?:\r?\n)*/, "")
+      .trim();
+    const extra = [before, after].filter(Boolean).join("\n").trim();
+    return extra ? extra.slice(0, MAX_PHONE_NOTE) : undefined;
+  }
+  return live.slice(0, MAX_PHONE_NOTE);
+}
+
 /** Lines longer than 75 octets continue on the next, after a space (RFC 6350 3.2). */
 function fold(line: string): string {
   const encoder = new TextEncoder();
@@ -449,7 +562,7 @@ export function registerContactsTools(server: McpServer, contacts: ICloudContact
     server,
     "contacts_sync",
     {
-      description: `Make the owner's iCloud Contacts show a directory, so the iPhone shows who is calling. contacts is the whole directory: each person becomes a card in the "${GROUP_NAME}" group, changed when they change, and the cards of people left out are deleted. These cards belong to the directory: an edit made on the phone is overwritten at the next sync. Contacts the owner made are never read or changed. At most ${MAX_WRITES} cards are written per call; when pending is above 0, call again with the same list.`,
+      description: `Make the owner's iCloud Contacts show a directory, so the iPhone shows who is calling. contacts is the whole directory: each person becomes a card in the "${GROUP_NAME}" group, changed when they change, and the cards of people left out are deleted. These cards belong to the directory (edits to fields on the phone are rewritten at the next sync, while extra NOTE text added on the phone is preserved). Contacts the owner made are never read or changed. At most ${MAX_WRITES} cards are written per call; when pending is above 0, call again with the same list.`,
       inputSchema: {
         contacts: z.array(contactSchema).max(5000).describe("Everyone the cards should show."),
       },
