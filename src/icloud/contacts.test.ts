@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ICloudContacts,
   MAX_WRITES,
+  extractVcardNote,
   nameParts,
   uidFor,
   vcard,
@@ -63,6 +64,15 @@ function fakeICloud(options: { putEtags?: boolean } = {}) {
             `<response><href>${path}</href><propstat><prop><getetag>${card.etag.replace(/"/g, "&quot;")}</getetag></prop></propstat></response>`
         ),
       ]);
+    }
+    if (method === "GET") {
+      const card = cards.get(url.pathname);
+      return card
+        ? new Response(card.text, {
+            status: 200,
+            headers: { etag: card.etag, "content-type": "text/vcard; charset=utf-8" },
+          })
+        : new Response(null, { status: 404 });
     }
     if (method === "PUT") {
       const etag = `"v${++version}"`;
@@ -176,6 +186,80 @@ describe("ICloudContacts", () => {
     expect(icloud.cards.has(`${BOOK}OWNERS-OWN.vcf`)).toBe(true);
   });
 
+  it("preserves extra NOTE text added on the phone across later syncs", async () => {
+    const icloud = fakeICloud();
+    const store = memoryKv();
+    const contacts = new ICloudContacts({
+      user: USER,
+      password: PASSWORD,
+      store,
+      fetch: icloud.fetch,
+    });
+    const withNote: ContactInput = { ...LIU, note: "宏慈療養院院長。" };
+    await contacts.sync([withNote]);
+
+    const liuUid = await uidFor(LIU.id);
+    const liuPath = `${BOOK}${liuUid}.vcf`;
+
+    // Owner appends a quick memo on the iPhone after a call.
+    icloud.cards.set(liuPath, {
+      text: vcard(liuUid, { ...withNote, note: "宏慈療養院院長。\n11/26 通話：下週三見面" }),
+      etag: '"phone-1"',
+    });
+    expect(await contacts.sync([withNote])).toMatchObject({ updated: 1, unchanged: 1 });
+    expect(extractVcardNote(icloud.cards.get(liuPath)!.text)).toBe(
+      "宏慈療養院院長。\n---\n11/26 通話：下週三見面"
+    );
+
+    // Next sync with no changes skips completely (no GET, no PUT).
+    const getsBefore = icloud.log.filter((l) => l.startsWith("GET ")).length;
+    expect(await contacts.sync([withNote])).toMatchObject({ updated: 0, unchanged: 2 });
+    expect(icloud.log.filter((l) => l.startsWith("GET "))).toHaveLength(getsBefore);
+
+    // Directory updates its note; the phone memo stays attached underneath.
+    const updatedDir: ContactInput = { ...LIU, note: "宏慈療養院院長，董事長。" };
+    expect(await contacts.sync([updatedDir])).toMatchObject({ updated: 1, unchanged: 1 });
+    expect(extractVcardNote(icloud.cards.get(liuPath)!.text)).toBe(
+      "宏慈療養院院長，董事長。\n---\n11/26 通話：下週三見面"
+    );
+
+    // Owner adds a second memo line on the phone; neither note is duplicated.
+    icloud.cards.set(liuPath, {
+      text: vcard(liuUid, {
+        ...updatedDir,
+        note: "宏慈療養院院長，董事長。\n---\n11/26 通話：下週三見面\n要帶 iPad",
+      }),
+      etag: '"phone-2"',
+    });
+    expect(await contacts.sync([updatedDir])).toMatchObject({ updated: 1, unchanged: 1 });
+    expect(extractVcardNote(icloud.cards.get(liuPath)!.text)).toBe(
+      "宏慈療養院院長，董事長。\n---\n11/26 通話：下週三見面\n要帶 iPad"
+    );
+
+    // Owner edits another field on the phone (not NOTE); directory field is restored, memo kept.
+    icloud.cards.set(liuPath, {
+      text: vcard(liuUid, {
+        ...updatedDir,
+        name: "劉院長",
+        note: "宏慈療養院院長，董事長。\n---\n11/26 通話：下週三見面\n要帶 iPad",
+      }),
+      etag: '"phone-3"',
+    });
+    expect(await contacts.sync([updatedDir])).toMatchObject({ updated: 1, unchanged: 1 });
+    expect(icloud.cards.get(liuPath)!.text).toContain("FN:劉慧卿\r\n");
+    expect(extractVcardNote(icloud.cards.get(liuPath)!.text)).toBe(
+      "宏慈療養院院長，董事長。\n---\n11/26 通話：下週三見面\n要帶 iPad"
+    );
+
+    // Owner removes the phone memo; the separator disappears.
+    icloud.cards.set(liuPath, {
+      text: vcard(liuUid, { ...updatedDir, note: "宏慈療養院院長，董事長。" }),
+      etag: '"phone-4"',
+    });
+    expect(await contacts.sync([updatedDir])).toMatchObject({ updated: 1, unchanged: 1 });
+    expect(extractVcardNote(icloud.cards.get(liuPath)!.text)).toBe("宏慈療養院院長，董事長。");
+  });
+
   it("reads back ETags a write did not return, so the next sync can skip the card", async () => {
     const icloud = fakeICloud({ putEtags: false });
     const contacts = new ICloudContacts({
@@ -243,6 +327,22 @@ describe("vcard", () => {
     expect(text).toContain("NOTE:line one\\nline\\; two ");
     for (const line of text.split("\r\n"))
       expect(new TextEncoder().encode(line).length).toBeLessThanOrEqual(75);
+  });
+
+  it("extracts folded and escaped NOTE lines", () => {
+    const note = `line one\nline; two, \\end ${"長".repeat(40)}`;
+    const text = vcard("U", {
+      id: "p_x",
+      name: "A, B",
+      phones: [{ number: "+15551234567" }],
+      note,
+    });
+    expect(extractVcardNote(text)).toBe(note);
+    expect(
+      extractVcardNote(
+        "BEGIN:VCARD\r\nitem1.NOTE;CHARSET=UTF-8:hi\\, there\\nnext\r\nEND:VCARD\r\n"
+      )
+    ).toBe("hi, there\nnext");
   });
 
   it("splits names into family and given", () => {
