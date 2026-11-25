@@ -41,6 +41,17 @@ address picks the account it is sent from.
 | `mail_settings` | primary address, iCloud sending addresses, display names, signatures |
 | `mail_health_check` | every account's sign-in, sending nothing |
 
+## Contacts
+
+`contacts_sync` makes the iCloud account's Contacts show a directory, so the
+iPhone shows who is calling: given everyone in it, it keeps one card per
+person in the group "comms", rewrites the cards that changed and deletes those
+of people left out. comms calls it with everyone in its people directory who
+has a phone number. The cards are the directory's (an edit on the phone is
+overwritten); contacts the owner made are never read or touched. It signs in
+to CardDAV with the iCloud IMAP login and app-specific password, and keeps each
+card's ETag in KV so a sync writes only what changed (`src/icloud/contacts.ts`).
+
 ## Data
 
 Account passwords and preferences are Worker secrets, uploaded by

@@ -225,8 +225,8 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
     ).json();
     const names = listed.result.tools.map((tool) => tool.name);
     // 13 mail_* tools for every account, 3 mail_listen_* webhooks, 8 Calendar,
-    // list_accounts, set_account_nickname and create_attachment_upload.
-    assert.equal(names.length, 27, names.join(", "));
+    // list_accounts, set_account_nickname, create_attachment_upload and contacts_sync.
+    assert.equal(names.length, 28, names.join(", "));
     for (const name of [
       "create_attachment_upload",
       "mail_search",
@@ -238,6 +238,7 @@ test("worker requires OAuth, gates approval on the owner password, and serves th
       "mail_listen_set",
       "mail_listen_list",
       "mail_listen_remove",
+      "contacts_sync",
     ]) {
       assert(names.includes(name), `${name} is listed`);
     }

@@ -10,6 +10,7 @@ import { Gmail } from "../google/gmail.js";
 import { googleInstructions, registerGoogleTools } from "../google/tools.js";
 import { addressDisplayName } from "../icloud/settings.js";
 import { mailInstructions, registerMailTools } from "../mail/tools.js";
+import { registerContactsTools, type ICloudContacts } from "../icloud/contacts.js";
 import { CONNECTOR_DESCRIPTION, CONNECTOR_NAME, CONNECTOR_TITLE } from "./identity.js";
 import { registerTool, toolResult } from "./tooling.js";
 import { registerUploadTool, UPLOAD_INSTRUCTIONS, type Uploads } from "./uploads.js";
@@ -24,6 +25,8 @@ declare const CONNECTOR_VERSION: string;
 export interface ConnectorServices {
   icloud?: ConnectorContext;
   google?: GoogleAccounts;
+  /** The iCloud account's Contacts, written by contacts_sync. */
+  contacts?: ICloudContacts;
 }
 
 /**
@@ -58,7 +61,7 @@ export async function createConnectorServer(
     mailListenGrant?: string;
   } = {}
 ): Promise<McpServer> {
-  const { icloud, google } = services;
+  const { icloud, google, contacts } = services;
   // A display name saved here for a Gmail address goes on its mail too.
   const gmail =
     google &&
@@ -90,6 +93,7 @@ export async function createConnectorServer(
   if (google) registerGoogleTools(server, google);
   if (mailListeners) registerMailListenTools(server, mailListeners, options.mailListenGrant);
   if (uploads) registerUploadTool(server, uploads);
+  if (contacts) registerContactsTools(server, contacts);
   registerTool(
     server,
     "list_accounts",

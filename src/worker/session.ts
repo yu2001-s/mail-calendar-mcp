@@ -20,6 +20,7 @@ import {
 } from "../services/imapClient.js";
 import { loadContext, type ConnectorContext, type Preferences } from "../icloud/context.js";
 import { kvSettingsStore } from "../icloud/settings.js";
+import { ICloudContacts } from "../icloud/contacts.js";
 import type { GoogleAccounts } from "../google/accounts.js";
 import { createConnectorServer } from "../mcp/server.js";
 import { MailWatcher, type WatchClient, type WatchStorage } from "../icloud/listeners.js";
@@ -116,6 +117,7 @@ export class MailSession {
   private readonly imap = persistentImap();
   private context?: ConnectorContext;
   private watcher?: MailWatcher;
+  private contacts?: ICloudContacts;
   /** Kept with the object so Google access tokens are reused across requests. */
   private google?: GoogleAccounts | null;
 
@@ -157,6 +159,17 @@ export class MailSession {
     return this.context;
   }
 
+  /** The iCloud account's Contacts, signed in to with its IMAP login and app-specific password. */
+  private icloudContacts(ctx: ConnectorContext): ICloudContacts {
+    const imap = resolveImapConfig(process.env, ctx.account);
+    this.contacts ??= new ICloudContacts({
+      user: imap.user,
+      password: imap.pass,
+      store: this.env.OAUTH_KV,
+    });
+    return this.contacts;
+  }
+
   private googleAccounts(origin: string | undefined): GoogleAccounts | undefined {
     if (this.google === undefined) this.google = googleAccountsFor(this.env) ?? null;
     if (this.google) this.google.manageUrl = `${origin ?? ""}/accounts`;
@@ -168,7 +181,11 @@ export class MailSession {
     const icloud = this.env.ICLOUD_MAIL_PREFERENCES ? this.connector() : undefined;
     await icloud?.refresh();
     const server = await createConnectorServer(
-      { icloud, google: this.googleAccounts(origin) },
+      {
+        icloud,
+        google: this.googleAccounts(origin),
+        contacts: icloud && this.icloudContacts(icloud),
+      },
       {
         websiteUrl: origin && `${origin}/`,
         uploads: origin ? workerUploads(this.env, origin) : undefined,
