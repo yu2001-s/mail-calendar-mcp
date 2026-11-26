@@ -362,13 +362,21 @@ export class Calendar {
     if (input.summary !== undefined) body.summary = input.summary;
     if (input.description !== undefined) body.description = input.description;
     if (input.location !== undefined) body.location = input.location;
+    // A PATCH merges start and end into the stored ones, so moving between all-day and timed
+    // must clear the other kind of time, or Google refuses an event with both.
+    const replacing = (time: GoogleTime) =>
+      !current
+        ? time
+        : time.date
+          ? { ...time, dateTime: null, timeZone: null }
+          : { date: null, ...time };
     if (input.start) {
       const allDay = DATE.test(input.start);
       let end = input.end;
       if (!end) {
         // Keep the current length when only the start moves; otherwise a day or an hour.
         const length =
-          current?.start && current?.end
+          current?.start && current?.end && Boolean(current.start.date) === allDay
             ? startMillis({ start: current.end }) - startMillis({ start: current.start })
             : 0;
         end = allDay
@@ -378,9 +386,19 @@ export class Calendar {
         // Google's all-day end date is exclusive.
         end = shiftTime(input.start, { days: 1 });
       }
-      body.start = timeField(input.start, input.timeZone);
-      body.end = timeField(end, input.timeZone);
+      if (DATE.test(end) !== allDay) {
+        throw new Error(
+          "Give start and end in the same form: both YYYY-MM-DD, or both date-times."
+        );
+      }
+      body.start = replacing(timeField(input.start, input.timeZone));
+      body.end = replacing(timeField(end, input.timeZone));
     } else if (input.end) {
+      if (current?.start && DATE.test(input.end) !== Boolean(current.start.date)) {
+        throw new Error(
+          "To switch between all day and a time, give start as well as end, both in the new form."
+        );
+      }
       body.end = timeField(input.end, input.timeZone ?? current?.end?.timeZone);
     }
     if (input.attendees !== undefined || input.optionalAttendees !== undefined) {
