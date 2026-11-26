@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **An all-day event can become a timed one, and back.** `calendar_update_event`
+  sent only `dateTime` in a PATCH, which Google merged into the stored
+  `start: { date }`, so the event had both and Google refused it. Switching
+  forms now clears the other kind of time (`date`, or `dateTime` and
+  `timeZone`), and a new start without an end gets the default hour or day
+  instead of the old event's length (an all-day event no longer turns into 24
+  hours). An end alone in the other form, or a start and end in different
+  forms, is refused with a message saying what to give.
 - **iCloud Contacts sync preserves phone-added notes.** When a card's ETag
   changed on the phone since the last sync, `contacts_sync` now fetches that
   card's live vCard and preserves any extra `NOTE` text the owner added below

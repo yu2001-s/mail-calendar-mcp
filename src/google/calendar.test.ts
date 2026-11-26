@@ -153,11 +153,65 @@ describe("Calendar", () => {
       "all"
     );
     const patch = calls.find((call) => call.method === "PATCH")!;
-    expect(patch.body.end).toEqual({ dateTime: "2026-10-09T15:45:00+08:00" });
+    expect(patch.body.end).toEqual({ date: null, dateTime: "2026-10-09T15:45:00+08:00" });
     expect(patch.body.attendees).toEqual([
       { email: "keep@example.com", responseStatus: "accepted" },
       { email: "new@example.com" },
     ]);
+  });
+
+  it("turns an all-day event into a timed one and back, clearing the other kind of time", async () => {
+    const allDay = { id: "e1", start: { date: "2026-11-26" }, end: { date: "2026-11-27" } };
+    const { calendar, calls } = fake((method, _u, body) =>
+      method === "GET" ? allDay : { ...allDay, ...body }
+    );
+    await calendar.updateEvent(
+      "a@gmail.com",
+      "primary",
+      "e1",
+      { start: "2026-11-26T11:19:00+08:00" },
+      "none"
+    );
+    const patch = calls.find((call) => call.method === "PATCH")!;
+    // Not the all-day event's 24 hours: a new time gets the default hour.
+    expect(patch.body.start).toEqual({ date: null, dateTime: "2026-11-26T11:19:00+08:00" });
+    expect(patch.body.end).toEqual({ date: null, dateTime: "2026-11-26T12:19:00+08:00" });
+
+    const timed = {
+      id: "e2",
+      start: { dateTime: "2026-11-26T11:19:00+08:00", timeZone: "Asia/Taipei" },
+      end: { dateTime: "2026-11-26T11:40:00+08:00", timeZone: "Asia/Taipei" },
+    };
+    const back = fake((method, _u, body) => (method === "GET" ? timed : { ...timed, ...body }));
+    await back.calendar.updateEvent(
+      "a@gmail.com",
+      "primary",
+      "e2",
+      { start: "2026-11-26" },
+      "none"
+    );
+    const undo = back.calls.find((call) => call.method === "PATCH")!;
+    expect(undo.body.start).toEqual({ date: "2026-11-26", dateTime: null, timeZone: null });
+    expect(undo.body.end).toEqual({ date: "2026-11-27", dateTime: null, timeZone: null });
+
+    await expect(
+      calendar.updateEvent(
+        "a@gmail.com",
+        "primary",
+        "e1",
+        { end: "2026-11-26T12:00:00+08:00" },
+        "none"
+      )
+    ).rejects.toThrow(/give start as well/);
+    await expect(
+      calendar.updateEvent(
+        "a@gmail.com",
+        "primary",
+        "e1",
+        { start: "2026-11-26T11:19:00+08:00", end: "2026-11-27" },
+        "none"
+      )
+    ).rejects.toThrow(/same form/);
   });
 
   it("responds as the invited account", async () => {
